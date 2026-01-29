@@ -1,0 +1,69 @@
+# File Organiser AI Configuration
+
+# Directories to watch
+watch_directories:
+  - ~/Downloads
+  - ~/Desktop
+
+# Target directories for organized files
+target_directories:
+  documents: ~/Documents
+  images: ~/Pictures
+  videos: ~/Videos
+  music: ~/Music
+  archives: ~/Archives
+  code: ~/Code
+
+# File type mappings
+file_types:
+  documents:
+    - pdf
+    - doc
+    - docx
+    - txt
+    - rtf
+  images:
+    - jpg
+    - jpeg
+    - png
+    - gif
+    - svg
+  videos:
+    - mp4
+    - avi
+    - mov
+    - mkv
+  music:
+    - mp3
+    - wav
+    - flac
+    - m4a
+  archives:
+    - zip
+    - rar
+    - tar
+    - gz
+  code:
+    - py
+    - js
+    - html
+    - css
+    - java
+
+# AI settings
+ai:
+  model: gpt-4
+  temperature: 0.7
+  max_tokens: 150
+
+# Processing settings
+processing:
+  delay_seconds: 5  # Wait time before processing a new file
+  batch_size: 10
+  enable_learning: true
+
+# Safety settings
+safety:
+  enable_undo: true
+  keep_undo_history_days: 30
+  require_confirmation: false
