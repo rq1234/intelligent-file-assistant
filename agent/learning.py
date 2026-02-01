@@ -81,3 +81,13 @@ class LearningSystem:
         """
         # TODO: Implement decision improvement using learned patterns
         return base_decision
+
+
+def decay_pattern(pattern_id, factor=0.6):
+    """
+    Reduce stored confidence/weight for a pattern after undo.
+    
+    This is a placeholder for future learning logic.
+    """
+    # TODO: Implement persistence for pattern confidence decay
+    pass

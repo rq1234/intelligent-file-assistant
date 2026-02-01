@@ -1,6 +1,7 @@
 """
 Utility functions
 """
-from .paths import normalize_path, ensure_directory_exists
+from .paths import expand
+from .hash import file_hash
 
-__all__ = ['normalize_path', 'ensure_directory_exists']
+__all__ = ['expand', 'file_hash']
