@@ -96,7 +96,8 @@ pub fn start_watcher(app_handle: AppHandle, watch_path: String) -> Result<(), St
 
 /// Process a file event and emit to frontend if it's a new file
 fn handle_file_event(app_handle: &AppHandle, event: &Event) {
-    // We only care about file creation events
+    // Only process Create events to avoid duplicates
+    // Note: Some downloads might appear as Modify events, but for v0.1 we ignore those
     match event.kind {
         EventKind::Create(_) => {
             // File was created
@@ -107,20 +108,8 @@ fn handle_file_event(app_handle: &AppHandle, event: &Event) {
                 }
             }
         }
-        EventKind::Modify(_) => {
-            // File was modified - we might want this for detecting when
-            // file finishes downloading (size stops changing)
-            for path in &event.paths {
-                if path.is_file() {
-                    // For now, we also treat modifications as potential new files
-                    // This catches files that are being downloaded/written
-                    // The debouncer ensures we only get notified when file is stable
-                    process_new_file(app_handle, path);
-                }
-            }
-        }
         _ => {
-            // Ignore other events (delete, access, etc.)
+            // Ignore modify, delete, access, etc.
         }
     }
 }
