@@ -4,7 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.rongq.file-organiser",
   "build": {
-    "frontendDist": "../src"
+    "beforeDevCommand": "npm run vite",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
   },
   "app": {
     "withGlobalTauri": true,
@@ -16,7 +18,18 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "capabilities": [
+        {
+          "identifier": "main-capability",
+          "windows": ["main"],
+          "permissions": [
+            "dialog:allow-open",
+            "dialog:default",
+            "core:default"
+          ]
+        }
+      ]
     }
   },
   "bundle": {
