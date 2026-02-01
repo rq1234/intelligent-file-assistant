@@ -1,6 +1,6 @@
 """
 File watcher module for monitoring directory changes
 """
-from .download_watcher import DownloadWatcher
+from .download_watcher import start_downloads_watcher, DownloadsHandler
 
-__all__ = ['DownloadWatcher']
+__all__ = ['start_downloads_watcher', 'DownloadsHandler']

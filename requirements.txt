@@ -1,5 +1,12 @@
 watchdog>=3.0.0
 pyyaml>=6.0
+rapidfuzz
+PyPDF2
+python-docx
+python-pptx
+pytesseract
+pillow
 openai>=1.0.0
 python-magic>=0.4.27
 pathlib>=1.0.1
+python-dotenv>=1.0.0

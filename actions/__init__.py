@@ -1,7 +1,7 @@
 """
 Actions module for file operations
 """
-from .mover import move_file, copy_file
-from .undo import undo_last_action, get_undo_history
+from .mover import move_file, is_duplicate
+from .undo import undo_last_move, undo_interactive, show_undo_history, undo_move
 
-__all__ = ['move_file', 'copy_file', 'undo_last_action', 'get_undo_history']
+__all__ = ['move_file', 'is_duplicate', 'undo_last_move', 'undo_interactive', 'show_undo_history', 'undo_move']

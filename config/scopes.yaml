@@ -1,49 +1,11 @@
-# Scopes define the organizational categories and rules
-
 scopes:
-  work:
-    keywords:
-      - invoice
-      - contract
-      - report
-      - meeting
-      - presentation
-    target: ~/Documents/Work
-    priority: high
-  
-  personal:
-    keywords:
-      - receipt
-      - bill
-      - bank
-      - insurance
-    target: ~/Documents/Personal
-    priority: medium
-  
-  education:
-    keywords:
-      - lecture
-      - assignment
-      - course
-      - study
-      - notes
-    target: ~/Documents/Education
-    priority: medium
-  
-  projects:
-    keywords:
-      - project
-      - development
-      - code
-      - repository
-    target: ~/Documents/Projects
-    priority: high
-  
-  media:
-    keywords:
-      - photo
-      - screenshot
-      - video
-      - recording
-    target: ~/Media
-    priority: low
+  - name: "Imperial Year 2"
+    root: "~/OneDrive/0 Rong/00 Imperial/0 Year 2"
+    folders:
+      - "Corporate Finance and Capital Markets"
+      - "Econometrics 1"
+      - "Machine Learning"
+      - "Microeconomics 2"
+      - "Operations Research"
+      - "z_Admin"
+

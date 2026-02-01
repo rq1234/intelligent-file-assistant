@@ -1,119 +1,58 @@
-"""
-File moving and copying operations
-"""
-import shutil
-from pathlib import Path
-from datetime import datetime
+import os
+from utils.hash import file_hash
+from storage.local_store import save_undo_history
 
 
-def move_file(source_path, target_path, store=None):
+def is_duplicate(src, dst_folder):
     """
-    Move a file from source to target location
+    Check if file already exists in destination folder
     
     Args:
-        source_path: Source file path
-        target_path: Target file path
-        store: LocalStore instance for recording the action
+        src: Source file path
+        dst_folder: Destination folder path
         
     Returns:
-        bool: True if successful, False otherwise
+        tuple: (bool, str or None) - (is_duplicate, existing_file_path)
     """
+    filename = os.path.basename(src)
+    dst_path = os.path.join(dst_folder, filename)
+    
+    # 1. Exact filename exists?
+    if not os.path.exists(dst_path):
+        return False, None
+    
+    # 2. If yes — check content similarity
+    # Compare file hashes
+    return file_hash(src) == file_hash(dst_path), dst_path
+
+def move_file(src, folder):
+    """
+    Move file to destination folder
+    
+    Returns:
+        tuple: (success: bool, error_type: str or None)
+        error_types: 'locked', 'duplicate', 'other'
+    """
+    # Check for duplicates before moving
+    is_dup, existing_path = is_duplicate(src, folder)
+    if is_dup:
+        print(f"⚠️  Duplicate detected! File already exists: {existing_path}")
+        print(f"Skipping move.")
+        return False, 'duplicate'
+    
+    # Normalize paths to use consistent separators
+    folder = os.path.normpath(folder)
+    os.makedirs(folder, exist_ok=True)
+    dst = os.path.join(folder, os.path.basename(src))
+    
     try:
-        source = Path(source_path)
-        target = Path(target_path)
-        
-        if not source.exists():
-            print(f"Source file does not exist: {source}")
-            return False
-        
-        # Create target directory if it doesn't exist
-        target.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Handle duplicate filenames
-        if target.exists():
-            target = get_unique_filename(target)
-        
-        # Move the file
-        shutil.move(str(source), str(target))
-        
-        # Record the action for undo functionality
-        if store:
-            store.record_action({
-                'type': 'move',
-                'source': str(source),
-                'target': str(target),
-                'timestamp': datetime.now().isoformat()
-            })
-        
-        return True
-        
+        os.rename(src, dst)
+        save_undo_history(src, dst)
+        print(f"✓ Moved to {dst}")
+        return True, None
+    except PermissionError:
+        print(f"⚠️  File locked - '{os.path.basename(src)}' is open in another program")
+        return False, 'locked'
     except Exception as e:
-        print(f"Error moving file: {e}")
-        return False
-
-
-def copy_file(source_path, target_path, store=None):
-    """
-    Copy a file from source to target location
-    
-    Args:
-        source_path: Source file path
-        target_path: Target file path
-        store: LocalStore instance for recording the action
-        
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    try:
-        source = Path(source_path)
-        target = Path(target_path)
-        
-        if not source.exists():
-            print(f"Source file does not exist: {source}")
-            return False
-        
-        # Create target directory if it doesn't exist
-        target.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Handle duplicate filenames
-        if target.exists():
-            target = get_unique_filename(target)
-        
-        # Copy the file
-        shutil.copy2(str(source), str(target))
-        
-        # Record the action
-        if store:
-            store.record_action({
-                'type': 'copy',
-                'source': str(source),
-                'target': str(target),
-                'timestamp': datetime.now().isoformat()
-            })
-        
-        return True
-        
-    except Exception as e:
-        print(f"Error copying file: {e}")
-        return False
-
-
-def get_unique_filename(file_path):
-    """
-    Generate a unique filename if the file already exists
-    
-    Args:
-        file_path: Path object
-        
-    Returns:
-        Path: Unique file path
-    """
-    path = Path(file_path)
-    counter = 1
-    
-    while path.exists():
-        new_name = f"{path.stem}_{counter}{path.suffix}"
-        path = path.parent / new_name
-        counter += 1
-    
-    return path
+        print(f"⚠️  Error moving file: {e}")
+        return False, 'other'
