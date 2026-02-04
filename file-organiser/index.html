@@ -9,36 +9,219 @@
   </head>
 
   <body>
-    <main class="container">
-      <h1>📁 File Organizer</h1>
-      <p class="subtitle">v0.1 - Manual Classification</p>
+    <!-- Onboarding Screen -->
+    <main id="onboarding-screen" class="container" style="display: none;">
+      <div class="onboarding-card">
+        <h1>Let's organize your coursework!</h1>
+        <p class="onboarding-subtitle">What modules are you taking?</p>
 
-      <!-- Settings Section -->
-      <div class="section">
-        <h2>⚙️ Settings</h2>
-        <div class="setting-group">
-          <label for="watch-path">Watch Folder:</label>
-          <input
-            type="text"
-            id="watch-path"
-            placeholder="C:\Users\You\Downloads"
-            readonly
-          />
-          <button id="select-folder-btn">Browse...</button>
+        <!-- Module List -->
+        <div id="module-list" class="module-list">
+          <!-- Modules will be added here dynamically -->
         </div>
 
-        <button id="start-watching-btn" class="primary-btn" disabled>
-          Start Watching
+        <!-- Add Module -->
+        <button id="add-module-btn" class="add-module-btn">+ Add Module</button>
+
+        <!-- Add Module Input (hidden by default) -->
+        <div id="add-module-input" class="add-module-input" style="display: none;">
+          <input type="text" id="new-module-name" placeholder="e.g. Machine Learning" />
+          <button id="confirm-add-btn" class="confirm-add-btn">Add</button>
+          <button id="cancel-add-btn" class="cancel-add-btn">Cancel</button>
+        </div>
+
+        <div class="onboarding-divider">
+          <span>OR</span>
+        </div>
+
+        <!-- Scan Existing Folders -->
+        <button id="scan-folders-btn" class="scan-folders-btn">
+          Scan existing course folders
         </button>
+
+        <!-- Base Path Setting -->
+        <div id="base-path-section" class="base-path-section">
+          <label>Education folder:</label>
+          <div class="base-path-row">
+            <input type="text" id="base-path-input" placeholder="Click Browse to select..." readonly />
+            <button id="browse-base-btn" class="browse-btn">Browse</button>
+          </div>
+        </div>
+
+        <div id="onboarding-status" class="status-msg"></div>
+
+        <!-- Continue Button -->
+        <button id="continue-btn" class="continue-btn" disabled>
+          Continue
+        </button>
+      </div>
+    </main>
+
+    <!-- Main App Screen -->
+    <main id="app-screen" class="container" style="display: none;">
+      <div class="app-header">
+        <div>
+          <h1>File Organizer</h1>
+          <p class="subtitle">v0.1 - AI Coursework Organizer</p>
+        </div>
+        <button id="settings-btn" class="settings-btn" title="Settings">&#9881;</button>
+      </div>
+
+      <!-- Config Summary + Start -->
+      <div class="section">
+        <div id="config-summary" class="config-summary"></div>
+        <div class="app-controls">
+          <button id="start-watching-btn" class="primary-btn" disabled>
+            Start Watching
+          </button>
+        </div>
         <div id="status-msg" class="status-msg"></div>
       </div>
 
       <!-- Detected Files Section -->
       <div class="section">
-        <h2>📄 Detected Files (<span id="file-count">0</span>)</h2>
+        <h2>Detected Files (<span id="file-count">0</span>)</h2>
+
+        <!-- Batch Actions -->
+        <div id="batch-actions" class="batch-actions" style="display: none;">
+          <button id="accept-all-high-btn" class="batch-btn">
+            Accept All High Confidence (<span id="high-confidence-count">0</span>)
+          </button>
+        </div>
+
         <div id="file-list" class="file-list">
           <p class="empty-msg">No files detected yet. Drop a file in your watched folder to test!</p>
         </div>
+      </div>
+
+      <!-- Activity Log -->
+      <div class="section">
+        <h2>Activity Log (<span id="activity-count">0</span>)</h2>
+        <div id="activity-list" class="activity-list">
+          <p class="empty-msg">No activity yet.</p>
+        </div>
+        <button id="clear-activity-btn" class="clear-activity-btn" style="display: none;">
+          Clear History
+        </button>
+      </div>
+
+      <!-- Undo Toast -->
+      <div id="undo-toast" class="undo-toast" style="display: none;">
+        <span id="undo-toast-msg"></span>
+        <button id="undo-btn" class="undo-btn">Undo (<span id="undo-countdown">10</span>s)</button>
+        <div id="undo-progress" class="undo-progress"></div>
+      </div>
+
+      <!-- Ignored Files (user-dismissed) -->
+      <div id="ignored-section" class="skipped-section" style="display: none;">
+        <div id="ignored-bar" class="skipped-bar">
+          <span><span id="ignored-count">0</span> files ignored</span>
+          <button id="review-ignored-btn" class="review-skipped-btn">Review</button>
+        </div>
+        <div id="ignored-list" class="skipped-list" style="display: none;">
+          <!-- Ignored files appear here when expanded -->
+        </div>
+      </div>
+
+      <!-- Skipped Files (non-educational) -->
+      <div id="skipped-section" class="skipped-section" style="display: none;">
+        <div id="skipped-bar" class="skipped-bar">
+          <span><span id="skipped-count">0</span> files skipped (not coursework)</span>
+          <button id="review-skipped-btn" class="review-skipped-btn">Review</button>
+        </div>
+        <div id="skipped-list" class="skipped-list" style="display: none;">
+          <!-- Skipped files appear here when expanded -->
+        </div>
+      </div>
+    </main>
+
+    <!-- Settings Screen -->
+    <main id="settings-screen" class="container" style="display: none;">
+      <div class="settings-card">
+        <div class="settings-header">
+          <button id="settings-back-btn" class="settings-back-btn" title="Back">&#8592; Back</button>
+          <h1>Settings</h1>
+        </div>
+
+        <!-- Education Folder -->
+        <div class="settings-section">
+          <h3>Education Folder</h3>
+          <p class="settings-desc">Root folder where your course folders live</p>
+          <div class="base-path-row">
+            <input type="text" id="settings-base-path" placeholder="Click Browse to select..." readonly />
+            <button id="settings-browse-base-btn" class="browse-btn">Browse</button>
+          </div>
+        </div>
+
+        <!-- Course Modules -->
+        <div class="settings-section">
+          <h3>Course Modules</h3>
+          <p class="settings-desc">Folders that files can be organized into</p>
+          <div id="settings-module-list" class="module-list"></div>
+          <button id="settings-add-module-btn" class="add-module-btn">+ Add Module</button>
+          <div id="settings-add-module-input" class="add-module-input" style="display: none;">
+            <input type="text" id="settings-new-module-name" placeholder="e.g. Machine Learning" />
+            <button id="settings-confirm-add-btn" class="confirm-add-btn">Add</button>
+            <button id="settings-cancel-add-btn" class="cancel-add-btn">Cancel</button>
+          </div>
+          <button id="settings-scan-folders-btn" class="scan-folders-btn" style="margin-top: 8px;">
+            Scan existing course folders
+          </button>
+        </div>
+
+        <!-- Watch Folder -->
+        <div class="settings-section">
+          <h3>Watch Folder</h3>
+          <p class="settings-desc">Folder to monitor for new files (e.g. Downloads)</p>
+          <div class="base-path-row">
+            <input type="text" id="settings-watch-path" placeholder="Click Browse to select..." readonly />
+            <button id="settings-browse-watch-btn" class="browse-btn">Browse</button>
+          </div>
+        </div>
+
+        <!-- Notifications -->
+        <div class="settings-section">
+          <h3>Notifications</h3>
+          <p class="settings-desc">Get notified when files are detected or auto-organized</p>
+          <div class="threshold-control">
+            <label class="toggle-label">
+              <input type="checkbox" id="settings-notifications-toggle" />
+              <span class="toggle-switch"></span>
+              <span>Enable notifications</span>
+            </label>
+          </div>
+          <p id="notification-permission-hint" class="settings-desc" style="display:none; color: #e67e22;">
+            Notification permission was denied by your OS. Please enable it in system settings.
+          </p>
+        </div>
+
+        <!-- Auto-Move -->
+        <div class="settings-section">
+          <h3>Auto-Move</h3>
+          <p class="settings-desc">Automatically organize files when AI confidence is high enough</p>
+          <div class="threshold-control">
+            <label class="toggle-label">
+              <input type="checkbox" id="settings-auto-move-toggle" />
+              <span class="toggle-switch"></span>
+              <span>Enable auto-move</span>
+            </label>
+          </div>
+          <div id="threshold-slider-group" class="threshold-slider-group" style="display: none;">
+            <label>Confidence threshold: <strong id="threshold-value">90%</strong></label>
+            <input type="range" id="settings-threshold-slider" class="threshold-slider"
+              min="70" max="100" value="90" step="5" />
+            <div class="threshold-labels">
+              <span>70%</span>
+              <span>100%</span>
+            </div>
+          </div>
+        </div>
+
+        <div id="settings-status" class="status-msg"></div>
+
+        <button id="settings-save-btn" class="continue-btn">
+          Save Settings
+        </button>
       </div>
     </main>
   </body>
