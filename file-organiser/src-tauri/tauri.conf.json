@@ -18,7 +18,7 @@
       }
     ],
     "security": {
-      "csp": null,
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: https://asset.localhost data:",
       "capabilities": [
         {
           "identifier": "main-capability",
@@ -26,7 +26,8 @@
           "permissions": [
             "dialog:allow-open",
             "dialog:default",
-            "core:default"
+            "core:default",
+            "notification:default"
           ]
         }
       ]

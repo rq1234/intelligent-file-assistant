@@ -64,7 +64,7 @@
           <h1>File Organizer</h1>
           <p class="subtitle">v0.1 - AI Coursework Organizer</p>
         </div>
-        <button id="settings-btn" class="settings-btn" title="Settings">&#9881;</button>
+        <button id="settings-btn" class="settings-btn" title="Settings" aria-label="Settings">&#9881;</button>
       </div>
 
       <!-- Config Summary + Start -->
@@ -76,6 +76,34 @@
           </button>
         </div>
         <div id="status-msg" class="status-msg"></div>
+        <div class="scan-section">
+          <div class="scan-divider"><span>or</span></div>
+          <p class="scan-desc">Already have files to organize? Scan a folder to classify existing files.</p>
+          <div class="scan-controls">
+            <div class="scan-limit-control">
+              <label for="scan-limit">Files to scan:</label>
+              <select id="scan-limit" class="scan-limit-select">
+                <option value="25" selected>Last 25</option>
+                <option value="50">Last 50</option>
+                <option value="100">Last 100</option>
+                <option value="custom">Custom</option>
+                <option value="0">All files</option>
+              </select>
+              <input type="number" id="scan-limit-custom" class="scan-limit-custom"
+                     min="1" max="9999" placeholder="e.g. 200" style="display: none;" />
+            </div>
+            <button id="scan-folder-btn" class="scan-btn" disabled>
+              Scan Existing Files
+            </button>
+          </div>
+          <div id="scan-progress" class="scan-progress" style="display: none;">
+            <div class="scan-progress-text">Scanning: <span id="scan-progress-count">0/0</span> files</div>
+            <div class="scan-progress-bar">
+              <div id="scan-progress-fill" class="scan-progress-fill"></div>
+            </div>
+            <button id="scan-cancel-btn" class="secondary-btn scan-cancel-btn">Cancel</button>
+          </div>
+        </div>
       </div>
 
       <!-- Detected Files Section -->
@@ -139,7 +167,7 @@
     <main id="settings-screen" class="container" style="display: none;">
       <div class="settings-card">
         <div class="settings-header">
-          <button id="settings-back-btn" class="settings-back-btn" title="Back">&#8592; Back</button>
+          <button id="settings-back-btn" class="settings-back-btn" title="Back" aria-label="Back to main screen">&#8592; Back</button>
           <h1>Settings</h1>
         </div>
 
@@ -195,6 +223,19 @@
           </p>
         </div>
 
+        <!-- Appearance -->
+        <div class="settings-section">
+          <h3>Appearance</h3>
+          <p class="settings-desc">Choose light or dark theme</p>
+          <div class="threshold-control">
+            <label class="toggle-label">
+              <input type="checkbox" id="settings-dark-mode-toggle" />
+              <span class="toggle-switch"></span>
+              <span>Dark mode</span>
+            </label>
+          </div>
+        </div>
+
         <!-- Auto-Move -->
         <div class="settings-section">
           <h3>Auto-Move</h3>
@@ -220,9 +261,16 @@
         <div id="settings-status" class="status-msg"></div>
 
         <button id="settings-save-btn" class="continue-btn">
-          Save Settings
+          Done
         </button>
       </div>
     </main>
+    <!-- Drag & Drop Overlay -->
+    <div id="drop-overlay" class="drop-overlay" style="display: none;">
+      <div class="drop-overlay-content">
+        <div class="drop-icon">+</div>
+        <p>Drop files here to classify</p>
+      </div>
+    </div>
   </body>
 </html>

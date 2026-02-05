@@ -5,10 +5,29 @@ use notify::{Event, EventKind, RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::mpsc::channel;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
+
+/// Shared stop signal for the watcher thread
+static STOP_SIGNAL: AtomicBool = AtomicBool::new(false);
+
+/// Check if the stop signal has been set
+pub fn should_stop() -> bool {
+    STOP_SIGNAL.load(Ordering::SeqCst)
+}
+
+/// Signal the watcher to stop
+pub fn signal_stop() {
+    STOP_SIGNAL.store(true, Ordering::SeqCst);
+}
+
+/// Reset the stop signal (call before starting a new watcher)
+pub fn reset_stop_signal() {
+    STOP_SIGNAL.store(false, Ordering::SeqCst);
+}
 
 /// Information about a detected file
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -38,13 +57,16 @@ pub struct FileInfo {
 pub fn start_watcher(app_handle: AppHandle, watch_path: String) -> Result<(), String> {
     println!("[WATCHER] Starting to watch: {}", watch_path);
 
+    // Reset stop signal before starting
+    reset_stop_signal();
+
     // Spawn background thread so we don't block the main app
     thread::spawn(move || {
         // Create channel for receiving file events
         let (tx, rx) = channel();
 
         // Create debounced watcher (waits 2 seconds after file stops changing)
-        let mut debouncer = new_debouncer(
+        let mut debouncer = match new_debouncer(
             Duration::from_secs(2),
             None, // No tick rate
             move |result: DebounceEventResult| {
@@ -63,32 +85,50 @@ pub fn start_watcher(app_handle: AppHandle, watch_path: String) -> Result<(), St
                     }
                 }
             },
-        )
-        .map_err(|e| format!("Failed to create watcher: {}", e))
-        .expect("Could not create file watcher");
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[WATCHER] Failed to create file watcher: {}", e);
+                return;
+            }
+        };
 
         // Start watching the directory (non-recursive - only top level)
-        debouncer
+        if let Err(e) = debouncer
             .watcher()
             .watch(&PathBuf::from(&watch_path), RecursiveMode::NonRecursive)
-            .map_err(|e| format!("Failed to watch directory: {}", e))
-            .expect("Could not watch directory");
+        {
+            eprintln!("[WATCHER] Failed to watch directory: {}", e);
+            return;
+        }
 
         println!("[WATCHER] Watching started successfully");
 
-        // Keep the watcher alive and process events
+        // Keep the watcher alive and process events, checking stop signal periodically
         loop {
-            match rx.recv() {
+            if should_stop() {
+                println!("[WATCHER] Stop signal received, shutting down");
+                break;
+            }
+
+            match rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(event) => {
                     // Process the file event
                     handle_file_event(&app_handle, &event);
                 }
-                Err(e) => {
-                    eprintln!("[WATCHER] Channel error: {}", e);
+                Err(RecvTimeoutError::Timeout) => {
+                    // No event — loop back and check stop signal
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    eprintln!("[WATCHER] Channel disconnected");
                     break;
                 }
             }
         }
+
+        println!("[WATCHER] Watcher thread exiting");
+        // Debouncer is dropped here, which stops the underlying watcher
     });
 
     Ok(())
@@ -138,7 +178,7 @@ fn process_new_file(app_handle: &AppHandle, path: &PathBuf) {
     println!("[WATCHER] Detected file: {} ({} bytes)", filename, size);
 
     // Emit event to frontend
-    app_handle
-        .emit("file-detected", &file_info)
-        .expect("Failed to emit file-detected event");
+    if let Err(e) = app_handle.emit("file-detected", &file_info) {
+        eprintln!("[WATCHER] Failed to emit file-detected event: {}", e);
+    }
 }

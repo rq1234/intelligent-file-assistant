@@ -1,5 +1,20 @@
-// Unit tests for main.js utility functions and logic
+// Unit tests for utility functions and logic
 // Run with: node src/main.test.js
+
+import {
+  formatFileSize,
+  escapeHtml,
+  getFileExt,
+  isImageFile,
+  isContentExtractable,
+  isToday,
+  shouldGroupAsBatch,
+  validateModuleName,
+  buildCorrectionHistory,
+  filterNewFiles,
+} from "./utils.js";
+
+import { CONFIDENCE_THRESHOLD } from "./constants.js";
 
 let passed = 0;
 let failed = 0;
@@ -36,77 +51,7 @@ function assertDeepEqual(actual, expected, message) {
   }
 }
 
-// ============================================================
-// Re-implement testable functions from main.js
-// (Since main.js relies on Tauri globals, we extract pure logic here)
-// ============================================================
-
-// --- formatFileSize ---
-function formatFileSize(bytes) {
-  if (bytes === 0) return "0 Bytes";
-  const k = 1024;
-  const sizes = ["Bytes", "KB", "MB", "GB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return Math.round(bytes / Math.pow(k, i) * 100) / 100 + " " + sizes[i];
-}
-
-// --- File type helpers ---
-const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
-const CONTENT_EXTRACTABLE_EXTS = ["pdf", "txt", "md", "csv"];
-const CONFIDENCE_THRESHOLD = 0.7;
-
-function getFileExt(filename) {
-  return filename.split(".").pop().toLowerCase();
-}
-
-function isImageFile(filename) {
-  return IMAGE_EXTS.includes(getFileExt(filename));
-}
-
-function isContentExtractable(filename) {
-  return CONTENT_EXTRACTABLE_EXTS.includes(getFileExt(filename));
-}
-
-// --- Batch detection logic ---
-const RAPID_WINDOW = 2000;
-const BATCH_WINDOW = 5000;
-const MIN_BATCH_SIZE = 3;
-
-function shouldGroupAsBatch(files) {
-  if (files.length === 1) return false;
-
-  let isRapidFire = true;
-  for (let i = 1; i < files.length; i++) {
-    if (files[i].timestamp - files[i - 1].timestamp > RAPID_WINDOW) {
-      isRapidFire = false;
-      break;
-    }
-  }
-  if (isRapidFire) return true;
-
-  if (files.length >= MIN_BATCH_SIZE) {
-    const totalTimeSpan = files[files.length - 1].timestamp - files[0].timestamp;
-    if (totalTimeSpan <= BATCH_WINDOW) return true;
-  }
-
-  return false;
-}
-
-// --- Correction history builder ---
-function buildCorrectionHistory(correctionLog) {
-  return correctionLog.map(c => {
-    if (c.type === "accepted") {
-      return `"${c.filename}" → ${c.userChose} (correct)`;
-    } else if (c.type === "corrected") {
-      return `"${c.filename}" → AI suggested ${c.aiSuggested}, but user moved to ${c.userChose}`;
-    } else if (c.type === "dismissed") {
-      return `"${c.filename}" → User dismissed this file (didn't want to organize it)`;
-    }
-    return "";
-  }).filter(s => s.length > 0);
-}
-
-// --- Activity log helpers ---
+// --- Activity log helpers (app-specific, not in utils.js) ---
 function addActivityEntry(activityLog, filename, fromFolder, toFolder) {
   const entry = {
     filename,
@@ -124,13 +69,6 @@ function markActivityUndone(activityLog, timestamp) {
   if (entry) {
     entry.undone = true;
   }
-}
-
-function isToday(date) {
-  const now = new Date();
-  return date.getDate() === now.getDate() &&
-    date.getMonth() === now.getMonth() &&
-    date.getFullYear() === now.getFullYear();
 }
 
 // ============================================================
@@ -312,27 +250,6 @@ console.log("\n=== Two-pass classification logic ===");
 // validateModuleName
 // ============================================================
 
-// Re-implement for testing
-function validateModuleName(name) {
-  if (!name || name.trim().length === 0) {
-    return "Module name cannot be empty";
-  }
-  if (name.includes("..") || name.includes("/") || name.includes("\\")) {
-    return "Module name cannot contain path separators or '..'";
-  }
-  const invalidChars = /[<>:"|?*]/;
-  if (invalidChars.test(name)) {
-    return 'Module name cannot contain < > : " | ? *';
-  }
-  if (/^\.+$/.test(name.trim())) {
-    return "Module name cannot be just dots";
-  }
-  if (name.trim().length > 100) {
-    return "Module name is too long (max 100 characters)";
-  }
-  return null;
-}
-
 console.log("\n=== validateModuleName ===");
 assertEqual(validateModuleName("Machine Learning"), null, "valid name accepted");
 assertEqual(validateModuleName("CS 101"), null, "name with spaces and numbers accepted");
@@ -354,6 +271,62 @@ assert(validateModuleName("a".repeat(101)) !== null, "101 char name rejected");
 assertEqual(validateModuleName("a".repeat(100)), null, "100 char name accepted");
 assertEqual(validateModuleName("Maths & Stats"), null, "ampersand allowed");
 assertEqual(validateModuleName("Year 2 (Semester 1)"), null, "parentheses allowed");
+
+// ============================================================
+// Bulk scan helpers
+// ============================================================
+
+console.log("\n=== filterNewFiles (bulk scan dedup) ===");
+{
+  const files = [
+    { name: "a.pdf", path: "C:\\Downloads\\a.pdf", size: 100 },
+    { name: "b.png", path: "C:\\Downloads\\b.png", size: 200 },
+    { name: "c.txt", path: "C:\\Downloads\\c.txt", size: 300 },
+    { name: "d.jpg", path: "C:\\Downloads\\d.jpg", size: 400 },
+  ];
+
+  // No existing files — all should pass through
+  let result = filterNewFiles(files, [], [], []);
+  assertEqual(result.length, 4, "all files pass when no existing");
+
+  // One in detected
+  result = filterNewFiles(files, [{ path: "C:\\Downloads\\a.pdf" }], [], []);
+  assertEqual(result.length, 3, "filters out detected file");
+  assert(!result.some(f => f.name === "a.pdf"), "a.pdf filtered from detected");
+
+  // One in skipped
+  result = filterNewFiles(files, [], [{ path: "C:\\Downloads\\b.png" }], []);
+  assertEqual(result.length, 3, "filters out skipped file");
+  assert(!result.some(f => f.name === "b.png"), "b.png filtered from skipped");
+
+  // One in ignored
+  result = filterNewFiles(files, [], [], [{ path: "C:\\Downloads\\c.txt" }]);
+  assertEqual(result.length, 3, "filters out ignored file");
+  assert(!result.some(f => f.name === "c.txt"), "c.txt filtered from ignored");
+
+  // Multiple across all lists
+  result = filterNewFiles(
+    files,
+    [{ path: "C:\\Downloads\\a.pdf" }],
+    [{ path: "C:\\Downloads\\b.png" }],
+    [{ path: "C:\\Downloads\\c.txt" }]
+  );
+  assertEqual(result.length, 1, "only untracked file remains");
+  assertEqual(result[0].name, "d.jpg", "d.jpg is the untracked file");
+
+  // All already tracked
+  result = filterNewFiles(
+    files,
+    [{ path: "C:\\Downloads\\a.pdf" }, { path: "C:\\Downloads\\b.png" }],
+    [{ path: "C:\\Downloads\\c.txt" }],
+    [{ path: "C:\\Downloads\\d.jpg" }]
+  );
+  assertEqual(result.length, 0, "no files when all tracked");
+
+  // Empty scan results
+  result = filterNewFiles([], [{ path: "C:\\Downloads\\a.pdf" }], [], []);
+  assertEqual(result.length, 0, "empty scan returns empty");
+}
 
 // ============================================================
 // SUMMARY
