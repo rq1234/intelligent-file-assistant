@@ -1,78 +1,132 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const { open } = window.__TAURI__.dialog;
+const { getCurrentWindow } = window.__TAURI__.window;
+const { openPath } = window.__TAURI__.opener;
+
+// state.js documents all mutable state in one place for future refactoring
+// import state from "./state.js";
+import {
+  STORAGE_KEYS,
+  UNDO_TIMEOUT_MS,
+  BATCH_WINDOW_MS,
+  CONFIDENCE_THRESHOLD,
+  QUICK_RETRY_DELAYS,
+  PATIENT_RETRY_DELAY_MS,
+  QUICK_RETRY_COUNT,
+  STATUS_TIMEOUT_MS,
+  ONBOARDING_STATUS_TIMEOUT_MS,
+  FILE_REMOVE_ANIMATION_MS,
+} from "./constants.js";
+import {
+  formatFileSize,
+  escapeHtml,
+  getFileExt,
+  isImageFile,
+  isContentExtractable,
+  isToday,
+  shouldGroupAsBatch,
+  validateModuleName,
+  buildCorrectionHistory,
+  filterNewFiles,
+} from "./utils.js";
+import {
+  addCorrection as dbAddCorrection,
+  getCorrections as dbGetCorrections,
+  addActivity as dbAddActivity,
+  getActivityLog as dbGetActivityLog,
+  markActivityUndone as dbMarkActivityUndone,
+  clearActivityLog as dbClearActivityLog,
+  migrateFromLocalStorage,
+} from "./storage.js";
 
 // ============================================================
-// LOCAL STORAGE KEYS
-// ============================================================
-const STORAGE_KEYS = {
-  modules: "fileorg_modules",       // Array of module names
-  basePath: "fileorg_base_path",    // Base education folder path
-  onboarded: "fileorg_onboarded",   // Boolean - has user completed setup
-  corrections: "fileorg_corrections", // Array of correction entries for AI learning
-  activityLog: "fileorg_activity_log", // Array of activity log entries
-  watchPath: "fileorg_watch_path",  // Watch folder path
-  autoMoveEnabled: "fileorg_auto_move_enabled", // Boolean - auto-move toggle
-  autoMoveThreshold: "fileorg_auto_move_threshold", // Number 0.7-1.0
-  notificationsEnabled: "fileorg_notifications_enabled", // Boolean - notifications toggle
-};
-
-const MAX_CORRECTIONS = 50; // Keep last 50 corrections to avoid bloating prompt
-const MAX_ACTIVITY_LOG = 100; // Keep last 100 activity entries
-const UNDO_TIMEOUT = 10000; // 10 seconds to undo
-
-// ============================================================
-// STATE
+// STATE (module-scope bindings backed by state.js)
 // ============================================================
 let watchPath = "";
 let detectedFiles = [];
 let isWatching = false;
-let retryQueue = [];
-
-// Batch detection state
 let pendingBatch = [];
 let batchTimer = null;
-
-// Two-tier batch detection thresholds
-const RAPID_WINDOW = 2000;
-const BATCH_WINDOW = 5000;
-const MIN_BATCH_SIZE = 3;
-
-// User config (loaded from localStorage)
-let userModules = [];   // e.g. ["Machine Learning", "Operations Research", ...]
-let basePath = "";      // e.g. "C:\Users\rongq\OneDrive\0 Year 2"
-
-// Skipped files (non-educational)
-let skippedFiles = [];  // { name, path, size, reasoning }
-
-// Ignored files (user-dismissed)
-let ignoredFiles = [];  // { name, path, size }
-
-// Correction history for AI learning
-let correctionLog = []; // { filename, aiSuggested, userChose, type }
-
-// Activity log
-let activityLog = []; // { filename, from, to, timestamp, undone }
-
-// Undo state
+let userModules = [];
+let basePath = "";
+let skippedFiles = [];
+let ignoredFiles = [];
+let correctionLog = [];
+let activityLog = [];
 let undoTimer = null;
 let undoCountdownInterval = null;
-let lastMove = null; // { filename, sourcePath, destPath, originalFolder }
-
-// Auto-move settings
+let lastMove = null;
 let autoMoveEnabled = false;
 let autoMoveThreshold = 0.9;
-
-// Notification settings
 let notificationsEnabled = false;
 let notificationApi = null;
+let darkModeEnabled = false;
+
+function applyTheme() {
+  document.documentElement.setAttribute("data-theme", darkModeEnabled ? "dark" : "light");
+}
 
 // ============================================================
 // INITIALIZATION
 // ============================================================
+// Restore saved window position & size from localStorage
+async function restoreWindowState() {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEYS.windowState);
+    if (!saved) return;
+    const state = JSON.parse(saved);
+    if (!state.width || !state.height) return;
+    const appWindow = getCurrentWindow();
+    const { LogicalSize, LogicalPosition } = window.__TAURI__.window;
+    await appWindow.setSize(new LogicalSize(state.width, state.height));
+    if (state.x !== undefined && state.y !== undefined) {
+      await appWindow.setPosition(new LogicalPosition(state.x, state.y));
+    }
+  } catch (e) {
+    console.error("Failed to restore window state:", e);
+  }
+}
+
 window.addEventListener("DOMContentLoaded", () => {
   // Check if user has already completed onboarding
   const isOnboarded = localStorage.getItem(STORAGE_KEYS.onboarded) === "true";
+
+  // Restore saved window position & size
+  restoreWindowState();
+
+  // Save window state on resize/move (debounced)
+  let windowStateTimer = null;
+  const saveWindowState = async () => {
+    clearTimeout(windowStateTimer);
+    windowStateTimer = setTimeout(async () => {
+      try {
+        const appWindow = getCurrentWindow();
+        const size = await appWindow.innerSize();
+        const pos = await appWindow.outerPosition();
+        localStorage.setItem(STORAGE_KEYS.windowState, JSON.stringify({
+          x: pos.x, y: pos.y, width: size.width, height: size.height,
+        }));
+      } catch (e) {
+        console.error("Failed to save window state:", e);
+      }
+    }, 500);
+  };
+  listen("tauri://resize", saveWindowState);
+  listen("tauri://move", saveWindowState);
+
+  // Minimize to system tray on close instead of quitting
+  const appWindow = getCurrentWindow();
+  appWindow.onCloseRequested(async (event) => {
+    event.preventDefault();
+    await appWindow.hide();
+    // Show a notification the first time so user knows app is still running
+    const firstHide = localStorage.getItem("fileorg_first_tray_hide");
+    if (!firstHide) {
+      sendAppNotification("File Organizer still running", "App minimized to system tray. Right-click tray icon to quit.");
+      localStorage.setItem("fileorg_first_tray_hide", "true");
+    }
+  });
 
   if (isOnboarded) {
     loadSavedConfig();
@@ -82,12 +136,18 @@ window.addEventListener("DOMContentLoaded", () => {
   }
 });
 
-function loadSavedConfig() {
+async function loadSavedConfig() {
   try {
+    // Migrate localStorage data to SQLite (one-time operation)
+    await migrateFromLocalStorage();
+
+    // Load corrections and activity from SQLite database
+    correctionLog = await dbGetCorrections();
+    activityLog = await dbGetActivityLog();
+
+    // Load other settings from localStorage (simpler for settings)
     const savedModules = localStorage.getItem(STORAGE_KEYS.modules);
     const savedBasePath = localStorage.getItem(STORAGE_KEYS.basePath);
-    const savedCorrections = localStorage.getItem(STORAGE_KEYS.corrections);
-    const savedActivity = localStorage.getItem(STORAGE_KEYS.activityLog);
     const savedWatchPath = localStorage.getItem(STORAGE_KEYS.watchPath);
     const savedAutoMove = localStorage.getItem(STORAGE_KEYS.autoMoveEnabled);
     const savedThreshold = localStorage.getItem(STORAGE_KEYS.autoMoveThreshold);
@@ -96,14 +156,6 @@ function loadSavedConfig() {
       if (Array.isArray(parsed)) userModules = parsed.filter(m => typeof m === "string");
     }
     if (savedBasePath) basePath = savedBasePath;
-    if (savedCorrections) {
-      const parsed = JSON.parse(savedCorrections);
-      if (Array.isArray(parsed)) correctionLog = parsed;
-    }
-    if (savedActivity) {
-      const parsed = JSON.parse(savedActivity);
-      if (Array.isArray(parsed)) activityLog = parsed;
-    }
     if (savedWatchPath) watchPath = savedWatchPath;
     const savedNotifications = localStorage.getItem(STORAGE_KEYS.notificationsEnabled);
     if (savedNotifications !== null) notificationsEnabled = savedNotifications === "true";
@@ -112,6 +164,13 @@ function loadSavedConfig() {
       const t = parseFloat(savedThreshold);
       if (!isNaN(t)) autoMoveThreshold = Math.min(1.0, Math.max(0.7, t));
     }
+    const savedTheme = localStorage.getItem(STORAGE_KEYS.theme);
+    if (savedTheme) {
+      darkModeEnabled = savedTheme === "dark";
+    } else {
+      darkModeEnabled = window.matchMedia("(prefers-color-scheme: dark)").matches;
+    }
+    applyTheme();
   } catch (e) {
     console.error("Failed to load saved config:", e);
   }
@@ -143,101 +202,41 @@ async function initNotifications() {
 function sendAppNotification(title, body) {
   if (!notificationsEnabled || !notificationApi) return;
   try {
-    notificationApi.sendNotification({ title, body });
+    // Prefix with app name for clarity (especially in dev mode where app name shows as PowerShell)
+    notificationApi.sendNotification({
+      title: `📁 ${title}`,
+      body
+    });
   } catch (e) {
     console.error("Notification failed:", e);
   }
 }
 
-// Save a correction to the log
-function logCorrection(filename, aiSuggested, userChose, type) {
-  correctionLog.push({ filename, aiSuggested, userChose, type, timestamp: Date.now() });
-  // Keep only the most recent corrections
-  if (correctionLog.length > MAX_CORRECTIONS) {
-    correctionLog = correctionLog.slice(-MAX_CORRECTIONS);
-  }
-  localStorage.setItem(STORAGE_KEYS.corrections, JSON.stringify(correctionLog));
+// Save a correction to the log (async, uses SQLite)
+async function logCorrection(filename, aiSuggested, userChose, type) {
+  // Save to SQLite database
+  await dbAddCorrection(filename, aiSuggested, userChose, type);
+  // Update in-memory log
+  correctionLog = await dbGetCorrections();
   console.log(`[CORRECTION] ${type}: "${filename}" | AI said "${aiSuggested}" → User chose "${userChose}"`);
 }
 
-// Build correction history strings for the AI prompt
-// Recent corrections are weighted more heavily and per-folder accuracy stats are appended
-function buildCorrectionHistory() {
-  if (correctionLog.length === 0) return [];
+// buildCorrectionHistory is imported from utils.js
 
-  // Prioritize recent corrections: show last 20 in full, summarize older ones
-  const recentCount = 20;
-  const recent = correctionLog.slice(-recentCount);
-  const older = correctionLog.slice(0, -recentCount);
-
-  const lines = [];
-
-  // Add per-folder accuracy summary
-  const folderStats = {};
-  for (const c of correctionLog) {
-    if (c.type === "dismissed") continue;
-    const folder = c.userChose || c.aiSuggested;
-    if (!folder) continue;
-    if (!folderStats[folder]) folderStats[folder] = { correct: 0, total: 0 };
-    folderStats[folder].total++;
-    if (c.type === "accepted") folderStats[folder].correct++;
-  }
-
-  const statsLines = Object.entries(folderStats)
-    .filter(([, s]) => s.total >= 2)
-    .map(([folder, s]) => `${folder}: ${Math.round((s.correct / s.total) * 100)}% accuracy (${s.correct}/${s.total})`)
-    .join(", ");
-
-  if (statsLines) {
-    lines.push(`[Folder accuracy stats: ${statsLines}]`);
-  }
-
-  // Summarize older corrections if any
-  if (older.length > 0) {
-    const olderCorrections = older.filter(c => c.type === "corrected").length;
-    const olderAccepted = older.filter(c => c.type === "accepted").length;
-    const olderDismissed = older.filter(c => c.type === "dismissed").length;
-    lines.push(`[Earlier history: ${olderAccepted} accepted, ${olderCorrections} corrected, ${olderDismissed} dismissed]`);
-  }
-
-  // Add recent corrections in full detail
-  for (const c of recent) {
-    if (c.type === "accepted") {
-      lines.push(`"${c.filename}" → ${c.userChose} (correct)`);
-    } else if (c.type === "corrected") {
-      lines.push(`"${c.filename}" → AI suggested ${c.aiSuggested}, but user moved to ${c.userChose}`);
-    } else if (c.type === "dismissed") {
-      lines.push(`"${c.filename}" → User dismissed this file (didn't want to organize it)`);
-    }
-  }
-
-  return lines;
-}
-
-// Save an activity log entry
-function addActivityEntry(filename, fromFolder, toFolder) {
-  const entry = {
-    filename,
-    from: fromFolder,
-    to: toFolder,
-    timestamp: Date.now(),
-    undone: false,
-  };
-  activityLog.unshift(entry); // newest first
-  if (activityLog.length > MAX_ACTIVITY_LOG) {
-    activityLog = activityLog.slice(0, MAX_ACTIVITY_LOG);
-  }
-  localStorage.setItem(STORAGE_KEYS.activityLog, JSON.stringify(activityLog));
+// Save an activity log entry (async, uses SQLite)
+async function addActivityEntry(filename, fromFolder, toFolder) {
+  // Save to SQLite database
+  const entry = await dbAddActivity(filename, fromFolder, toFolder);
+  // Update in-memory log
+  activityLog = await dbGetActivityLog();
   return entry;
 }
 
-// Mark the most recent activity entry as undone
-function markActivityUndone(timestamp) {
-  const entry = activityLog.find(e => e.timestamp === timestamp);
-  if (entry) {
-    entry.undone = true;
-    localStorage.setItem(STORAGE_KEYS.activityLog, JSON.stringify(activityLog));
-  }
+// Mark the most recent activity entry as undone (async, uses SQLite)
+async function markActivityUndone(timestamp) {
+  await dbMarkActivityUndone(timestamp);
+  // Update in-memory log
+  activityLog = await dbGetActivityLog();
 }
 
 // ============================================================
@@ -278,11 +277,15 @@ function initOnboarding() {
         multiple: false,
         title: "Select your education folder (e.g. Year 2)",
       });
-      if (selected) {
+      if (selected && selected !== basePath) {
         basePath = selected;
         basePathInput.value = selected;
+        // Clear modules - they belonged to the old folder
+        userModules = [];
+        renderModuleList();
         localStorage.setItem(STORAGE_KEYS.basePath, selected);
-        showOnboardingStatus("Education folder set", "success");
+        localStorage.setItem(STORAGE_KEYS.modules, JSON.stringify(userModules));
+        showOnboardingStatus("Folder set - click 'Scan' to detect modules", "info");
         updateContinueBtn();
       }
     } catch (error) {
@@ -404,7 +407,7 @@ function initOnboarding() {
       item.className = "module-item";
       item.innerHTML = `
         <span class="module-name">${escapeHtml(name)}</span>
-        <button class="module-remove-btn" title="Remove module">&times;</button>
+        <button class="module-remove-btn" title="Remove module" aria-label="Remove module">&times;</button>
       `;
       item.querySelector(".module-remove-btn").addEventListener("click", () => {
         userModules.splice(index, 1);
@@ -429,7 +432,7 @@ function initOnboarding() {
         onboardingStatus.textContent = "";
         onboardingStatus.className = "status-msg";
       }
-    }, 4000);
+    }, ONBOARDING_STATUS_TIMEOUT_MS);
   }
 }
 
@@ -462,54 +465,78 @@ function initSettings() {
   const thresholdGroup = document.getElementById("threshold-slider-group");
   const notificationsToggle = document.getElementById("settings-notifications-toggle");
   const notificationHint = document.getElementById("notification-permission-hint");
+  const darkModeToggle = document.getElementById("settings-dark-mode-toggle");
   const saveBtn = document.getElementById("settings-save-btn");
   const settingsStatus = document.getElementById("settings-status");
 
-  // Work with copies so we can discard changes on back
-  let tempModules = [...userModules];
-  let tempBasePath = basePath;
-  let tempWatchPath = watchPath || "C:\\Users\\rongq\\Downloads";
-  let tempAutoMoveEnabled = autoMoveEnabled;
-  let tempAutoMoveThreshold = autoMoveThreshold;
-  let tempNotificationsEnabled = notificationsEnabled;
+  // Auto-save helper - persists settings immediately
+  function autoSaveSettings() {
+    localStorage.setItem(STORAGE_KEYS.modules, JSON.stringify(userModules));
+    localStorage.setItem(STORAGE_KEYS.basePath, basePath);
+    localStorage.setItem(STORAGE_KEYS.watchPath, watchPath);
+    localStorage.setItem(STORAGE_KEYS.autoMoveEnabled, String(autoMoveEnabled));
+    localStorage.setItem(STORAGE_KEYS.autoMoveThreshold, String(autoMoveThreshold));
+    localStorage.setItem(STORAGE_KEYS.notificationsEnabled, String(notificationsEnabled));
+    localStorage.setItem(STORAGE_KEYS.theme, darkModeEnabled ? "dark" : "light");
+  }
 
-  // Populate current values
-  basePathInput.value = tempBasePath;
-  watchPathInput.value = tempWatchPath;
-  notificationsToggle.checked = tempNotificationsEnabled;
+  // Populate current values (working directly with global state)
+  basePathInput.value = basePath;
+  watchPathInput.value = watchPath || "";
+  notificationsToggle.checked = notificationsEnabled;
   notificationHint.style.display = "none";
-  autoMoveToggle.checked = tempAutoMoveEnabled;
-  thresholdSlider.value = Math.round(tempAutoMoveThreshold * 100);
-  thresholdValue.textContent = Math.round(tempAutoMoveThreshold * 100) + "%";
-  thresholdGroup.style.display = tempAutoMoveEnabled ? "block" : "none";
+  autoMoveToggle.checked = autoMoveEnabled;
+  thresholdSlider.value = Math.round(autoMoveThreshold * 100);
+  thresholdValue.textContent = Math.round(autoMoveThreshold * 100) + "%";
+  thresholdGroup.style.display = autoMoveEnabled ? "block" : "none";
+  darkModeToggle.checked = darkModeEnabled;
   renderSettingsModuleList();
 
-  // Remove old listeners by cloning elements
-  const newBackBtn = backBtn.cloneNode(true);
-  backBtn.parentNode.replaceChild(newBackBtn, backBtn);
-  newBackBtn.addEventListener("click", () => {
-    document.getElementById("settings-screen").style.display = "none";
-    document.getElementById("app-screen").style.display = "block";
+  // Dark mode toggle - clone switch to remove old handlers
+  const oldDarkModeSwitch = darkModeToggle.nextElementSibling;
+  const darkModeSwitch = oldDarkModeSwitch.cloneNode(true);
+  oldDarkModeSwitch.parentNode.replaceChild(darkModeSwitch, oldDarkModeSwitch);
+  darkModeSwitch.addEventListener("click", function(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    darkModeToggle.checked = !darkModeToggle.checked;
+    darkModeEnabled = darkModeToggle.checked;
+    applyTheme();
+    autoSaveSettings();
   });
 
+  // Helper to close settings and return to main app
+  function closeSettings() {
+    document.getElementById("settings-screen").style.display = "none";
+    document.getElementById("app-screen").style.display = "block";
+    updateConfigSummary();
+  }
+
+  // Back button - just close (changes are auto-saved)
+  const newBackBtn = backBtn.cloneNode(true);
+  backBtn.parentNode.replaceChild(newBackBtn, backBtn);
+  newBackBtn.addEventListener("click", closeSettings);
+
+  // Done button - create folders and close (settings already auto-saved)
   const newSaveBtn = saveBtn.cloneNode(true);
+  newSaveBtn.textContent = "Done";
   saveBtn.parentNode.replaceChild(newSaveBtn, saveBtn);
   newSaveBtn.addEventListener("click", async () => {
-    if (tempModules.length === 0) {
+    if (userModules.length === 0) {
       showSettingsStatus("Please add at least one module", "error");
       return;
     }
-    if (!tempBasePath) {
+    if (!basePath) {
       showSettingsStatus("Please select an education folder", "error");
       return;
     }
 
     newSaveBtn.disabled = true;
-    newSaveBtn.textContent = "Saving...";
+    newSaveBtn.textContent = "Creating folders...";
 
-    // Create any missing folders
-    for (const moduleName of tempModules) {
-      const folderPath = tempBasePath + "\\" + moduleName;
+    // Create any missing module folders
+    for (const moduleName of userModules) {
+      const folderPath = basePath + "\\" + moduleName;
       try {
         await invoke("create_folder", { path: folderPath });
       } catch (error) {
@@ -517,29 +544,9 @@ function initSettings() {
       }
     }
 
-    // Apply changes to state
-    userModules = tempModules;
-    basePath = tempBasePath;
-    watchPath = tempWatchPath;
-    autoMoveEnabled = tempAutoMoveEnabled;
-    autoMoveThreshold = tempAutoMoveThreshold;
-    notificationsEnabled = tempNotificationsEnabled;
-
-    // Save to localStorage
-    localStorage.setItem(STORAGE_KEYS.modules, JSON.stringify(userModules));
-    localStorage.setItem(STORAGE_KEYS.basePath, basePath);
-    localStorage.setItem(STORAGE_KEYS.watchPath, watchPath);
-    localStorage.setItem(STORAGE_KEYS.autoMoveEnabled, String(autoMoveEnabled));
-    localStorage.setItem(STORAGE_KEYS.autoMoveThreshold, String(autoMoveThreshold));
-    localStorage.setItem(STORAGE_KEYS.notificationsEnabled, String(notificationsEnabled));
-
     newSaveBtn.disabled = false;
-    newSaveBtn.textContent = "Save Settings";
-
-    // Return to app and refresh
-    document.getElementById("settings-screen").style.display = "none";
-    document.getElementById("app-screen").style.display = "block";
-    updateConfigSummary();
+    newSaveBtn.textContent = "Done";
+    closeSettings();
   });
 
   // Browse education folder
@@ -548,10 +555,14 @@ function initSettings() {
   newBrowseBase.addEventListener("click", async () => {
     try {
       const selected = await open({ directory: true, multiple: false, title: "Select your education folder" });
-      if (selected) {
-        tempBasePath = selected;
+      if (selected && selected !== basePath) {
+        basePath = selected;
         basePathInput.value = selected;
-        showSettingsStatus("Education folder updated", "success");
+        // Clear modules - they belonged to the old folder
+        userModules = [];
+        renderSettingsModuleList();
+        autoSaveSettings();
+        showSettingsStatus("Folder changed - click 'Scan' to detect modules", "info");
       }
     } catch (error) {
       showSettingsStatus(`Error: ${error}`, "error");
@@ -565,9 +576,10 @@ function initSettings() {
     try {
       const selected = await open({ directory: true, multiple: false, title: "Select folder to watch" });
       if (selected) {
-        tempWatchPath = selected;
+        watchPath = selected;
         watchPathInput.value = selected;
-        showSettingsStatus("Watch folder updated", "success");
+        autoSaveSettings();
+        showSettingsStatus("Watch folder saved", "success");
       }
     } catch (error) {
       showSettingsStatus(`Error: ${error}`, "error");
@@ -578,20 +590,21 @@ function initSettings() {
   const newScanBtn = scanFoldersBtn.cloneNode(true);
   scanFoldersBtn.parentNode.replaceChild(newScanBtn, scanFoldersBtn);
   newScanBtn.addEventListener("click", async () => {
-    if (!tempBasePath) {
+    if (!basePath) {
       showSettingsStatus("Please select your education folder first", "error");
       return;
     }
     newScanBtn.disabled = true;
     newScanBtn.textContent = "Scanning...";
     try {
-      const folders = await invoke("scan_folders", { path: tempBasePath });
+      const folders = await invoke("scan_folders", { path: basePath });
       if (folders.length === 0) {
         showSettingsStatus("No subfolders found", "info");
       } else {
-        tempModules = folders;
+        userModules = folders;
         renderSettingsModuleList();
-        showSettingsStatus(`Found ${folders.length} course folders`, "success");
+        autoSaveSettings();
+        showSettingsStatus(`Found ${folders.length} course folders - saved!`, "success");
       }
     } catch (error) {
       showSettingsStatus(`Scan failed: ${error}`, "error");
@@ -618,12 +631,13 @@ function initSettings() {
         showSettingsStatus(validationError, "error");
         return;
       }
-      if (tempModules.some(m => m.toLowerCase() === name.toLowerCase())) {
+      if (userModules.some(m => m.toLowerCase() === name.toLowerCase())) {
         showSettingsStatus("Module already exists", "error");
         return;
       }
-      tempModules.push(name);
+      userModules.push(name);
       renderSettingsModuleList();
+      autoSaveSettings();
     }
     addModuleInput.style.display = "none";
     newAddBtn.style.display = "block";
@@ -650,60 +664,76 @@ function initSettings() {
     }
   };
 
-  // Notification toggle
-  notificationsToggle.onchange = async () => {
-    if (notificationsToggle.checked) {
-      // Request OS permission when enabling
+  // Notification toggle - clone switch to remove old handlers
+  notificationsToggle.checked = notificationsEnabled;
+  const oldNotifSwitch = notificationsToggle.nextElementSibling;
+  const notifSwitch = oldNotifSwitch.cloneNode(true);
+  oldNotifSwitch.parentNode.replaceChild(notifSwitch, oldNotifSwitch);
+  notifSwitch.addEventListener("click", async function(e) {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const newState = !notificationsToggle.checked;
+    notificationsToggle.checked = newState;
+    notificationsEnabled = newState;
+
+    if (newState && notificationApi) {
       try {
-        if (notificationApi) {
-          const granted = await notificationApi.isPermissionGranted();
-          if (!granted) {
-            const permission = await notificationApi.requestPermission();
-            if (permission !== "granted") {
-              notificationsToggle.checked = false;
-              notificationHint.style.display = "block";
-              tempNotificationsEnabled = false;
-              return;
-            }
+        const granted = await notificationApi.isPermissionGranted();
+        if (!granted) {
+          const permission = await notificationApi.requestPermission();
+          if (permission !== "granted") {
+            notificationsToggle.checked = false;
+            notificationsEnabled = false;
+            notificationHint.style.display = "block";
           }
         }
-        notificationHint.style.display = "none";
-        tempNotificationsEnabled = true;
-      } catch (e) {
-        console.error("Notification permission error:", e);
-        notificationsToggle.checked = false;
-        tempNotificationsEnabled = false;
+      } catch (err) {
+        console.error("Notification permission error:", err);
       }
-    } else {
-      tempNotificationsEnabled = false;
+    }
+
+    if (!newState) {
       notificationHint.style.display = "none";
     }
-  };
+    autoSaveSettings();
+  });
 
-  // Auto-move toggle
-  autoMoveToggle.onchange = () => {
-    tempAutoMoveEnabled = autoMoveToggle.checked;
-    thresholdGroup.style.display = tempAutoMoveEnabled ? "block" : "none";
-  };
+  // Auto-move toggle - clone switch to remove old handlers
+  autoMoveToggle.checked = autoMoveEnabled;
+  const oldAutoMoveSwitch = autoMoveToggle.nextElementSibling;
+  const autoMoveSwitch = oldAutoMoveSwitch.cloneNode(true);
+  oldAutoMoveSwitch.parentNode.replaceChild(autoMoveSwitch, oldAutoMoveSwitch);
+  autoMoveSwitch.addEventListener("click", function(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    autoMoveToggle.checked = !autoMoveToggle.checked;
+    autoMoveEnabled = autoMoveToggle.checked;
+    thresholdGroup.style.display = autoMoveEnabled ? "block" : "none";
+    autoSaveSettings();
+  });
 
-  // Threshold slider
-  thresholdSlider.oninput = () => {
-    tempAutoMoveThreshold = parseInt(thresholdSlider.value) / 100;
-    thresholdValue.textContent = thresholdSlider.value + "%";
+  // Threshold slider - use oninput to replace any existing handler
+  thresholdSlider.value = Math.round(autoMoveThreshold * 100);
+  thresholdSlider.oninput = function() {
+    autoMoveThreshold = parseInt(this.value) / 100;
+    thresholdValue.textContent = this.value + "%";
+    autoSaveSettings();
   };
 
   function renderSettingsModuleList() {
     moduleList.innerHTML = "";
-    tempModules.forEach((name, index) => {
+    userModules.forEach((name, index) => {
       const item = document.createElement("div");
       item.className = "module-item";
       item.innerHTML = `
         <span class="module-name">${escapeHtml(name)}</span>
-        <button class="module-remove-btn" title="Remove module">&times;</button>
+        <button class="module-remove-btn" title="Remove module" aria-label="Remove module">&times;</button>
       `;
       item.querySelector(".module-remove-btn").addEventListener("click", () => {
-        tempModules.splice(index, 1);
+        userModules.splice(index, 1);
         renderSettingsModuleList();
+        autoSaveSettings();
       });
       moduleList.appendChild(item);
     });
@@ -717,7 +747,7 @@ function initSettings() {
         settingsStatus.textContent = "";
         settingsStatus.className = "status-msg";
       }
-    }, 4000);
+    }, ONBOARDING_STATUS_TIMEOUT_MS);
   }
 }
 
@@ -740,6 +770,12 @@ function updateConfigSummary() {
   const moduleCount = userModules.length;
   const autoMoveDisplay = autoMoveEnabled ? `Auto-move: ${Math.round(autoMoveThreshold * 100)}%+` : "Auto-move: off";
   summary.innerHTML = `<strong>Watching:</strong> ${escapeHtml(watchDisplay)} &nbsp;|&nbsp; <strong>${moduleCount}</strong> modules &nbsp;|&nbsp; ${autoMoveDisplay}`;
+
+  // Update scan button state based on modules
+  const scanFolderBtn = document.querySelector("#scan-folder-btn");
+  if (scanFolderBtn) {
+    scanFolderBtn.disabled = userModules.length === 0;
+  }
 }
 
 function initApp() {
@@ -768,6 +804,15 @@ function initApp() {
   const undoBtn = document.querySelector("#undo-btn");
   const undoCountdownEl = document.querySelector("#undo-countdown");
   const undoProgress = document.querySelector("#undo-progress");
+  const scanFolderBtn = document.querySelector("#scan-folder-btn");
+  const scanProgress = document.querySelector("#scan-progress");
+  const scanProgressCount = document.querySelector("#scan-progress-count");
+  const scanProgressFill = document.querySelector("#scan-progress-fill");
+  const scanCancelBtn = document.querySelector("#scan-cancel-btn");
+  const scanLimitSelect = document.querySelector("#scan-limit");
+  const scanLimitCustom = document.querySelector("#scan-limit-custom");
+  let scanInProgress = false;
+  let scanCancelled = false;
   let skippedExpanded = false;
 
   // Wire up skipped files review toggle
@@ -789,9 +834,9 @@ function initApp() {
   undoBtn.addEventListener("click", handleUndo);
 
   // Wire up clear activity log
-  clearActivityBtn.addEventListener("click", () => {
+  clearActivityBtn.addEventListener("click", async () => {
+    await dbClearActivityLog();
     activityLog = [];
-    localStorage.setItem(STORAGE_KEYS.activityLog, JSON.stringify(activityLog));
     renderActivityLog();
   });
 
@@ -804,20 +849,37 @@ function initApp() {
   });
 
   // Set up event listeners
-  startWatchingBtn.addEventListener("click", startWatching);
+  startWatchingBtn.addEventListener("click", toggleWatching);
   acceptAllHighBtn.addEventListener("click", acceptAllHighConfidence);
+  scanFolderBtn.addEventListener("click", startBulkScan);
+  scanCancelBtn.addEventListener("click", () => { scanCancelled = true; });
+
+  // Show/hide custom input when "Custom" is selected
+  scanLimitSelect.addEventListener("change", () => {
+    scanLimitCustom.style.display = scanLimitSelect.value === "custom" ? "inline-block" : "none";
+    if (scanLimitSelect.value === "custom") {
+      scanLimitCustom.focus();
+    }
+  });
 
   // Listen for file detection events from Rust
   setupFileListener();
 
-  // Use saved watch path or default to Downloads
-  if (!watchPath) {
-    watchPath = "C:\\Users\\rongq\\Downloads";
-    localStorage.setItem(STORAGE_KEYS.watchPath, watchPath);
-  }
-  startWatchingBtn.disabled = false;
+  // Listen for tray hint notification
+  setupTrayHintListener();
+
+  // Set up drag & drop on app window
+  setupDragAndDrop();
+
+  // Set up keyboard shortcuts
+  setupKeyboardShortcuts();
+
+  // Watch path must be configured by the user via Settings > Browse
+  scanFolderBtn.disabled = userModules.length === 0;
   updateConfigSummary();
-  showStatus("Ready to watch", "info");
+
+  // Check if watcher is already running (e.g. after navigating back from Settings)
+  checkWatcherState();
 
   // --- Build available folders from user modules ---
   function getAvailableFolders() {
@@ -834,26 +896,274 @@ function initApp() {
     return options;
   }
 
-  // Start watching the selected folder
-  async function startWatching() {
-    if (!watchPath) {
-      showStatus("Please select a folder first", "error");
+  // Quick-create a module from an unsorted file card
+  async function quickCreateModule(fileInfo, fileItem, classification) {
+    const name = prompt("Enter new module name:");
+    if (!name || !name.trim()) return;
+
+    const trimmed = name.trim();
+    const validationError = validateModuleName(trimmed);
+    if (validationError) {
+      showStatus(validationError, "error");
       return;
     }
+    if (userModules.some(m => m.toLowerCase() === trimmed.toLowerCase())) {
+      showStatus("Module already exists", "error");
+      return;
+    }
+
+    // Add module
+    userModules.push(trimmed);
+    localStorage.setItem(STORAGE_KEYS.modules, JSON.stringify(userModules));
+
+    // Create the folder
+    const fullPath = basePath + "\\" + trimmed;
+    try {
+      await invoke("create_folder", { path: fullPath });
+    } catch (e) {
+      console.error(`Failed to create folder for ${trimmed}:`, e);
+    }
+
+    // Update all folder dropdowns on existing cards
+    const newOptions = buildFolderOptions();
+    document.querySelectorAll(".folder-select").forEach(sel => {
+      const currentVal = sel.value;
+      sel.innerHTML = newOptions;
+      sel.value = currentVal;
+    });
+
+    // Auto-select and move to the new module
+    const folderSelect = fileItem.querySelector(".folder-select");
+    if (folderSelect) {
+      folderSelect.value = fullPath;
+    }
+
+    // Update suggestion display
+    const suggestionDiv = fileItem.querySelector(".ai-suggestion");
+    if (suggestionDiv) {
+      suggestionDiv.innerHTML = `
+        <div class="ai-result high">
+          <strong>New module:</strong> ${escapeHtml(trimmed)}
+          <button class="accept-btn">Move Here</button>
+        </div>
+        <div class="ai-reasoning">${escapeHtml(classification.reasoning)}</div>
+      `;
+      suggestionDiv.querySelector(".accept-btn").addEventListener("click", function() {
+        acceptAISuggestion(fileInfo.path, fullPath, this);
+      });
+    }
+
+    updateConfigSummary();
+    scanFolderBtn.disabled = false;
+    showStatus(`Module "${trimmed}" created`, "success");
+  }
+
+  // Check watcher state on init (handles returning from Settings)
+  async function checkWatcherState() {
+    try {
+      const running = await invoke("is_watcher_running");
+      isWatching = running;
+      updateWatchButton();
+      if (running) {
+        showStatus(`Watching ${watchPath}`, "success");
+      } else if (watchPath && userModules.length > 0) {
+        // Auto-start watching if watch path and modules are configured
+        try {
+          await invoke("start_watching", { path: watchPath });
+          isWatching = true;
+          updateWatchButton();
+          showStatus(`Watching ${watchPath}`, "success");
+        } catch (autoErr) {
+          console.error("Auto-start watching failed:", autoErr);
+          showStatus("Ready to watch", "info");
+        }
+      } else {
+        showStatus("Ready to watch", "info");
+      }
+    } catch (e) {
+      console.error("Failed to check watcher state:", e);
+      showStatus("Ready to watch", "info");
+    }
+  }
+
+  // Update button text/style based on watcher state
+  function updateWatchButton() {
     if (isWatching) {
-      showStatus("Already watching!", "info");
+      startWatchingBtn.textContent = "Stop Watching";
+      startWatchingBtn.disabled = false;
+      startWatchingBtn.classList.add("watching");
+    } else {
+      startWatchingBtn.textContent = "Start Watching";
+      startWatchingBtn.disabled = false;
+      startWatchingBtn.classList.remove("watching");
+    }
+  }
+
+  // Toggle watching on/off
+  async function toggleWatching() {
+    if (isWatching) {
+      // Stop watching
+      try {
+        await invoke("stop_watching");
+        isWatching = false;
+        updateWatchButton();
+        showStatus("Stopped watching", "info");
+      } catch (error) {
+        showStatus(`Failed to stop watching: ${error}`, "error");
+      }
+    } else {
+      // Start watching
+      if (!watchPath) {
+        showStatus("Please select a folder first", "error");
+        return;
+      }
+      try {
+        await invoke("start_watching", { path: watchPath });
+        isWatching = true;
+        updateWatchButton();
+        showStatus(`Watching ${watchPath}`, "success");
+      } catch (error) {
+        showStatus(`Failed to start watching: ${error}`, "error");
+      }
+    }
+  }
+
+  // Bulk scan: scan existing files in a chosen folder
+  async function startBulkScan() {
+    if (scanInProgress) {
+      showStatus("Scan already in progress", "info");
+      return;
+    }
+    if (userModules.length === 0) {
+      showStatus("Please add modules first in Settings", "error");
       return;
     }
 
     try {
-      await invoke("start_watching", { path: watchPath });
-      isWatching = true;
-      startWatchingBtn.textContent = "Watching...";
-      startWatchingBtn.disabled = true;
-      showStatus(`Watching ${watchPath}`, "success");
+      // Open folder picker — default to last scanned folder
+      const lastScanFolder = localStorage.getItem(STORAGE_KEYS.lastScanFolder) || undefined;
+      const selectedPath = await open({
+        directory: true,
+        title: "Select folder to scan",
+        defaultPath: lastScanFolder,
+      });
+      if (!selectedPath) return; // User cancelled
+
+      // Remember this folder for next time
+      localStorage.setItem(STORAGE_KEYS.lastScanFolder, selectedPath);
+
+      scanInProgress = true;
+      scanCancelled = false;
+      scanFolderBtn.disabled = true;
+
+      // Get list of files from Rust
+      showStatus(`Scanning ${selectedPath}...`, "info");
+      const files = await invoke("scan_files", { path: selectedPath });
+
+      if (files.length === 0) {
+        showStatus("No files found in selected folder", "info");
+        scanInProgress = false;
+        scanFolderBtn.disabled = false;
+        return;
+      }
+
+      // Filter out files already tracked
+      const existingPaths = new Set([
+        ...detectedFiles.map(f => f.path),
+        ...skippedFiles.map(f => f.path),
+        ...ignoredFiles.map(f => f.path),
+      ]);
+      let newFiles = files.filter(f => !existingPaths.has(f.path));
+
+      if (newFiles.length === 0) {
+        showStatus("All files in this folder are already tracked", "info");
+        scanInProgress = false;
+        scanFolderBtn.disabled = false;
+        return;
+      }
+
+      // Apply scan limit
+      let scanLimit;
+      if (scanLimitSelect.value === "custom") {
+        scanLimit = parseInt(scanLimitCustom.value, 10) || 0;
+      } else {
+        scanLimit = parseInt(scanLimitSelect.value, 10);
+      }
+      if (scanLimit > 0 && newFiles.length > scanLimit) {
+        newFiles = newFiles.slice(0, scanLimit);
+      }
+
+      // Show progress bar
+      scanProgress.style.display = "flex";
+      scanProgressFill.style.width = "0%";
+      scanProgressCount.textContent = `0/${newFiles.length}`;
+
+      // Process files sequentially, tracking outcomes
+      let processed = 0;
+      let scanAutoMoved = 0;
+      let scanNeedReview = 0;
+      let scanSkipped = 0;
+      for (const file of newFiles) {
+        if (scanCancelled) {
+          break;
+        }
+
+        const skippedBefore = skippedFiles.length;
+
+        file.timestamp = Date.now();
+        await addDetectedFile(file);
+        processed++;
+
+        // Determine outcome: auto-moved (not in detected or skipped), skipped, or needs review
+        const wasSkipped = skippedFiles.length > skippedBefore;
+        const stillInDetected = detectedFiles.some(f => f.path === file.path);
+        if (wasSkipped) {
+          scanSkipped++;
+        } else if (!stillInDetected) {
+          scanAutoMoved++;
+        } else {
+          scanNeedReview++;
+        }
+
+        // Update progress
+        const pct = Math.round((processed / newFiles.length) * 100);
+        scanProgressFill.style.width = `${pct}%`;
+        scanProgressCount.textContent = `${processed}/${newFiles.length}`;
+      }
+
+      // Show summary
+      if (scanCancelled) {
+        showStatus(`Scan cancelled: ${processed} processed — ${scanAutoMoved} auto-moved, ${scanNeedReview} need review, ${scanSkipped} skipped`, "info");
+      } else {
+        const parts = [];
+        if (scanAutoMoved > 0) parts.push(`${scanAutoMoved} auto-moved`);
+        if (scanNeedReview > 0) parts.push(`${scanNeedReview} need review`);
+        if (scanSkipped > 0) parts.push(`${scanSkipped} skipped`);
+        showStatus(`Scan complete: ${parts.join(", ")}`, "success");
+      }
+
+      // Hide progress bar and reset state
+      scanProgress.style.display = "none";
+      scanInProgress = false;
+      scanCancelled = false;
+      scanFolderBtn.disabled = false;
+
     } catch (error) {
-      showStatus(`Failed to start watching: ${error}`, "error");
+      showStatus(`Scan failed: ${error}`, "error");
+      scanProgress.style.display = "none";
+      scanInProgress = false;
+      scanCancelled = false;
+      scanFolderBtn.disabled = false;
     }
+  }
+
+  // Set up listener for tray hint (when window is minimized to tray)
+  function setupTrayHintListener() {
+    listen("tray-hint", (event) => {
+      const message = event.payload;
+      sendAppNotification("File Organizer", message);
+      console.log("[APP] " + message);
+    });
   }
 
   // Set up listener for file detection events from Rust
@@ -866,12 +1176,108 @@ function initApp() {
       pendingBatch.push(fileInfo);
 
       if (batchTimer) clearTimeout(batchTimer);
-      batchTimer = setTimeout(() => processBatch(), BATCH_WINDOW);
+      batchTimer = setTimeout(() => processBatch(), BATCH_WINDOW_MS);
 
       if (pendingBatch.length === 1) {
         showStatus(`Detecting files... (${pendingBatch.length} file)`, "info");
       } else {
         showStatus(`Detecting files... (${pendingBatch.length} files)`, "info");
+      }
+    });
+  }
+
+  // Set up drag & drop on app window
+  function setupDragAndDrop() {
+    const dropOverlay = document.getElementById("drop-overlay");
+
+    listen("tauri://drag-drop", async (event) => {
+      dropOverlay.style.display = "none";
+      document.body.classList.remove("drag-over");
+
+      const paths = event.payload.paths || [];
+      if (paths.length === 0) return;
+      if (userModules.length === 0) {
+        showStatus("Please add modules first in Settings", "error");
+        return;
+      }
+
+      console.log(`[DRAG-DROP] ${paths.length} file(s) dropped`);
+
+      for (const filePath of paths) {
+        // Extract filename and get file size via scan_files on parent dir
+        const parts = filePath.replace(/\//g, "\\").split("\\");
+        const name = parts.pop();
+        const fileInfo = { name, path: filePath, size: 0, timestamp: Date.now() };
+
+        // Skip if already tracked
+        const alreadyTracked = detectedFiles.some(f => f.path === filePath)
+          || skippedFiles.some(f => f.path === filePath)
+          || ignoredFiles.some(f => f.path === filePath);
+        if (alreadyTracked) {
+          showStatus(`${name} is already tracked`, "info");
+          continue;
+        }
+
+        showStatus(`Dropped: ${name}`, "success");
+        await addDetectedFile(fileInfo);
+      }
+    });
+
+    listen("tauri://drag-over", () => {
+      dropOverlay.style.display = "flex";
+      document.body.classList.add("drag-over");
+    });
+
+    listen("tauri://drag-leave", () => {
+      dropOverlay.style.display = "none";
+      document.body.classList.remove("drag-over");
+    });
+  }
+
+  // Keyboard shortcuts for quick file actions
+  function setupKeyboardShortcuts() {
+    document.addEventListener("keydown", (e) => {
+      // Don't trigger shortcuts when typing in inputs
+      const tag = e.target.tagName.toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select") return;
+
+      // Get the first (top) file card in the list
+      const topCard = fileList.querySelector(".file-item");
+      if (!topCard) return;
+
+      switch (e.key.toLowerCase()) {
+        case "a": {
+          // Accept AI suggestion
+          const acceptBtn = topCard.querySelector(".accept-btn");
+          if (acceptBtn && !acceptBtn.disabled) {
+            acceptBtn.click();
+          }
+          break;
+        }
+        case "i": {
+          // Ignore / dismiss
+          const ignoreBtn = topCard.querySelector(".ignore-btn");
+          if (ignoreBtn) {
+            ignoreBtn.click();
+          }
+          break;
+        }
+        case "d": {
+          // Delete (trash)
+          const trashBtn = topCard.querySelector(".trash-btn");
+          if (trashBtn && !trashBtn.disabled) {
+            trashBtn.click();
+          }
+          break;
+        }
+        case "p": {
+          // Preview toggle
+          const previewBtn = topCard.querySelector(".preview-btn");
+          if (previewBtn) {
+            previewBtn.click();
+          }
+          break;
+        }
       }
     });
   }
@@ -900,26 +1306,7 @@ function initApp() {
     batchTimer = null;
   }
 
-  // Two-tier batch detection logic
-  function shouldGroupAsBatch(files) {
-    if (files.length === 1) return false;
-
-    let isRapidFire = true;
-    for (let i = 1; i < files.length; i++) {
-      if (files[i].timestamp - files[i - 1].timestamp > RAPID_WINDOW) {
-        isRapidFire = false;
-        break;
-      }
-    }
-    if (isRapidFire) return true;
-
-    if (files.length >= MIN_BATCH_SIZE) {
-      const totalTimeSpan = files[files.length - 1].timestamp - files[0].timestamp;
-      if (totalTimeSpan <= BATCH_WINDOW) return true;
-    }
-
-    return false;
-  }
+  // shouldGroupAsBatch is imported from utils.js
 
   // Create a batch container
   function createBatchContainer(batchSize) {
@@ -952,29 +1339,14 @@ function initApp() {
     return batchContainer.querySelector(".batch-files");
   }
 
-  // File type detection helpers
-  const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
-  const CONTENT_EXTRACTABLE_EXTS = ["pdf", "txt", "md", "csv"];
-  const CONFIDENCE_THRESHOLD = 0.7; // Below this, try content-based second pass
-
-  function getFileExt(filename) {
-    return filename.split(".").pop().toLowerCase();
-  }
-
-  function isImageFile(filename) {
-    return IMAGE_EXTS.includes(getFileExt(filename));
-  }
-
-  function isContentExtractable(filename) {
-    return CONTENT_EXTRACTABLE_EXTS.includes(getFileExt(filename));
-  }
+  // File type helpers and CONFIDENCE_THRESHOLD imported from utils.js / constants.js
 
   // Two-pass classification:
   // Pass 1: Classify by filename (fast, cheap)
   // Pass 2: If confidence < threshold, use content analysis (vision for images, text extraction for PDFs)
   async function invokeClassify(fileInfo, statusCallback) {
     const availableFolders = getAvailableFolders();
-    const correctionHistory = buildCorrectionHistory();
+    const correctionHistory = buildCorrectionHistory(correctionLog);
 
     // Pass 1: Filename-based classification
     if (statusCallback) statusCallback("Analyzing filename...");
@@ -994,8 +1366,11 @@ function initApp() {
     // because the filename alone can't determine if a screenshot contains academic content
     if (canUseVision && firstPass.confidence < CONFIDENCE_THRESHOLD) {
       // Skip the short-circuit — go straight to vision pass below
+    } else if (canExtractText) {
+      // Skip the short-circuit — ALWAYS extract content for PDFs/text files
+      // Filenames like "PS1_sol.pdf" are too generic; actual content is far more reliable
     } else if (firstPass.confidence >= CONFIDENCE_THRESHOLD || (!firstPass.is_relevant && firstPass.confidence === 0)) {
-      // High confidence or clearly not relevant (and not an image) — use first pass
+      // High confidence or clearly not relevant (and not an image/pdf) — use first pass
       return firstPass;
     }
 
@@ -1034,7 +1409,7 @@ function initApp() {
     }
 
     if (canExtractText) {
-      console.log(`[PASS 2] Low confidence (${firstPass.confidence}), extracting content for: ${fileInfo.name}`);
+      console.log(`[PASS 2] Extracting content for: ${fileInfo.name} (filename confidence: ${firstPass.confidence}, but content is more reliable)`);
       if (statusCallback) statusCallback("Filename unclear - reading file content for better classification...");
       try {
         return await invoke("classify_with_content", {
@@ -1083,17 +1458,16 @@ function initApp() {
       }
 
       // Auto-move: if enabled and confidence meets threshold, move automatically
+      // Skip auto-move for unsorted files (no matching module)
       if (autoMoveEnabled && classification.is_relevant &&
           classification.confidence >= autoMoveThreshold &&
-          classification.suggested_folder) {
+          classification.suggested_folder &&
+          classification.suggested_folder !== "__UNSORTED__") {
         const suggestedModuleName = classification.suggested_folder.split("\\").pop();
         console.log(`[AUTO-MOVE] ${fileInfo.name} → ${suggestedModuleName} (${Math.round(classification.confidence * 100)}%)`);
 
         try {
-          await invoke("move_file", {
-            sourcePath: fileInfo.path,
-            destFolder: classification.suggested_folder,
-          });
+          await moveWithAutoRename(fileInfo.path, classification.suggested_folder);
 
           const filename = fileInfo.name;
           const moduleName = suggestedModuleName;
@@ -1119,31 +1493,52 @@ function initApp() {
       const confidencePercent = Math.round(classification.confidence * 100);
       const confidenceClass = classification.confidence > 0.8 ? "high" : classification.confidence > 0.5 ? "medium" : "low";
 
-      const suggestedModuleName = classification.suggested_folder.split("\\").pop();
+      const isUnsorted = classification.suggested_folder === "__UNSORTED__";
 
-      suggestionDiv.innerHTML = `
-        <div class="ai-result ${confidenceClass}">
-          <strong>AI Suggests:</strong> ${escapeHtml(suggestedModuleName)}
-          <span class="confidence">${confidencePercent}% confident</span>
-          <button class="accept-btn">Accept</button>
-        </div>
-        <div class="ai-reasoning">${escapeHtml(classification.reasoning)}</div>
-      `;
+      if (isUnsorted) {
+        // File is educational but doesn't match any configured module
+        suggestionDiv.innerHTML = `
+          <div class="ai-result low">
+            <strong>No matching module</strong>
+            <span class="confidence">Educational but doesn't fit current modules</span>
+            <button class="create-module-btn">+ Create Module</button>
+          </div>
+          <div class="ai-reasoning">${escapeHtml(classification.reasoning)}</div>
+        `;
+        // Wire up create module button
+        suggestionDiv.querySelector(".create-module-btn").addEventListener("click", () => {
+          quickCreateModule(fileInfo, fileItem, classification);
+        });
+        // Don't pre-select any folder — user must pick manually or ignore
+        const folderSelect = fileItem.querySelector(".folder-select");
+        folderSelect.value = "";
+      } else {
+        const suggestedModuleName = classification.suggested_folder.split("\\").pop();
 
-      suggestionDiv.querySelector(".accept-btn").addEventListener("click", function() {
-        acceptAISuggestion(fileInfo.path, classification.suggested_folder, this);
-      });
+        suggestionDiv.innerHTML = `
+          <div class="ai-result ${confidenceClass}">
+            <strong>AI Suggests:</strong> ${escapeHtml(suggestedModuleName)}
+            <span class="confidence">${confidencePercent}% confident</span>
+            <button class="accept-btn">Accept</button>
+          </div>
+          <div class="ai-reasoning">${escapeHtml(classification.reasoning)}</div>
+        `;
 
-      const folderSelect = fileItem.querySelector(".folder-select");
-      folderSelect.value = classification.suggested_folder;
+        suggestionDiv.querySelector(".accept-btn").addEventListener("click", function() {
+          acceptAISuggestion(fileInfo.path, classification.suggested_folder, this);
+        });
+
+        const folderSelect = fileItem.querySelector(".folder-select");
+        folderSelect.value = classification.suggested_folder;
+      }
 
       const fileIndex = detectedFiles.findIndex(f => f.path === fileInfo.path);
       if (fileIndex > -1) {
         detectedFiles[fileIndex].classification = classification;
-        detectedFiles[fileIndex].isHighConfidence = classification.confidence > 0.8;
+        detectedFiles[fileIndex].isHighConfidence = classification.confidence > 0.8 && !isUnsorted;
       }
 
-      if (classification.confidence > 0.8) {
+      if (classification.confidence > 0.8 && !isUnsorted) {
         fileItem.setAttribute("data-high-confidence", "true");
         fileItem.setAttribute("data-suggested-folder", classification.suggested_folder);
       }
@@ -1252,14 +1647,24 @@ function initApp() {
     fileItem.innerHTML = `
       <div class="file-header">
         <div class="file-info">
-          <strong>${escapeHtml(fileInfo.name)}</strong>
+          <strong class="file-name-display">${escapeHtml(fileInfo.name)}</strong>
+          <button class="rename-btn" title="Rename file" aria-label="Rename file">&#9998;</button>
           <small>${formatFileSize(fileInfo.size)}</small>
         </div>
-        <button class="dismiss-btn" title="Dismiss - don't organize this file">&times;</button>
+        <button class="dismiss-btn" title="Dismiss - don't organize this file" aria-label="Dismiss file">&times;</button>
+      </div>
+      <div class="file-rename-input" style="display: none;">
+        <input type="text" class="rename-input" value="${escapeHtml(fileInfo.name)}" />
+        <button class="rename-confirm-btn">Save</button>
+        <button class="rename-cancel-btn">Cancel</button>
       </div>
       <div class="file-path">
         <span>${escapeHtml(fileInfo.path)}</span>
       </div>
+      <div class="file-preview-toggle">
+        <button class="preview-btn">Preview</button>
+      </div>
+      <div class="file-preview" style="display: none;"></div>
       <div class="ai-suggestion">
         <div class="ai-loading">Analyzing with AI...</div>
       </div>
@@ -1269,6 +1674,7 @@ function initApp() {
         </select>
         <button class="move-btn">Move</button>
         <button class="ignore-btn">Ignore</button>
+        <button class="trash-btn" title="Send to recycle bin">Delete</button>
       </div>
     `;
 
@@ -1285,6 +1691,108 @@ function initApp() {
     // Bind dismiss button
     fileItem.querySelector(".dismiss-btn").addEventListener("click", function() {
       dismissFile(fileInfo, fileItem);
+    });
+
+    // Bind trash (delete) button
+    fileItem.querySelector(".trash-btn").addEventListener("click", async function() {
+      if (!confirm(`Send "${fileInfo.name}" to Recycle Bin?`)) return;
+      this.disabled = true;
+      this.textContent = "Deleting...";
+      try {
+        await invoke("trash_file", { filePath: fileInfo.path });
+        removeFileFromUI(fileInfo.path, fileItem);
+        showStatus(`Deleted: ${fileInfo.name} (sent to Recycle Bin)`, "success");
+      } catch (error) {
+        showStatus(`Delete failed: ${error}`, "error");
+        this.disabled = false;
+        this.textContent = "Delete";
+      }
+    });
+
+    // Bind rename button
+    const renameBtn = fileItem.querySelector(".rename-btn");
+    const renameInputDiv = fileItem.querySelector(".file-rename-input");
+    const renameInput = fileItem.querySelector(".rename-input");
+    const renameConfirmBtn = fileItem.querySelector(".rename-confirm-btn");
+    const renameCancelBtn = fileItem.querySelector(".rename-cancel-btn");
+    const fileNameDisplay = fileItem.querySelector(".file-name-display");
+
+    renameBtn.addEventListener("click", () => {
+      renameInputDiv.style.display = "flex";
+      renameInput.value = fileInfo.name;
+      renameInput.focus();
+      renameInput.setSelectionRange(0, fileInfo.name.lastIndexOf(".") > 0 ? fileInfo.name.lastIndexOf(".") : fileInfo.name.length);
+    });
+
+    renameCancelBtn.addEventListener("click", () => {
+      renameInputDiv.style.display = "none";
+    });
+
+    const doRename = async () => {
+      const newName = renameInput.value.trim();
+      if (!newName || newName === fileInfo.name) {
+        renameInputDiv.style.display = "none";
+        return;
+      }
+      try {
+        const newPath = await invoke("rename_file", { filePath: fileInfo.path, newName });
+        // Update fileInfo in place
+        const oldName = fileInfo.name;
+        fileInfo.name = newName;
+        fileInfo.path = newPath;
+        fileNameDisplay.textContent = newName;
+        fileItem.querySelector(".file-path span").textContent = newPath;
+        fileItem.setAttribute("data-file-path", newPath);
+        // Update in detectedFiles array
+        const idx = detectedFiles.findIndex(f => f.path === fileInfo.path || f.name === oldName);
+        if (idx > -1) {
+          detectedFiles[idx].name = newName;
+          detectedFiles[idx].path = newPath;
+        }
+        renameInputDiv.style.display = "none";
+        showStatus(`Renamed to: ${newName}`, "success");
+      } catch (error) {
+        showStatus(`Rename failed: ${error}`, "error");
+      }
+    };
+
+    renameConfirmBtn.addEventListener("click", doRename);
+    renameInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") doRename();
+      if (e.key === "Escape") renameInputDiv.style.display = "none";
+    });
+
+    // Bind preview button (lazy-load on first click)
+    const previewBtn = fileItem.querySelector(".preview-btn");
+    const previewDiv = fileItem.querySelector(".file-preview");
+    let previewLoaded = false;
+    previewBtn.addEventListener("click", async () => {
+      if (previewDiv.style.display !== "none") {
+        previewDiv.style.display = "none";
+        previewBtn.textContent = "Preview";
+        return;
+      }
+      previewDiv.style.display = "block";
+      previewBtn.textContent = "Hide";
+
+      if (previewLoaded) return;
+      previewLoaded = true;
+      previewDiv.innerHTML = '<div class="preview-loading">Loading preview...</div>';
+
+      try {
+        const preview = await invoke("get_file_preview", { filePath: fileInfo.path });
+        if (preview.error) {
+          previewDiv.innerHTML = `<div class="preview-error">${escapeHtml(preview.error)}</div>`;
+        } else if (preview.preview_type === "image") {
+          previewDiv.innerHTML = `<img class="preview-image" src="${preview.content}" alt="Preview" />`;
+        } else if (preview.preview_type === "text" && preview.content) {
+          previewDiv.innerHTML = `<pre class="preview-text">${escapeHtml(preview.content)}</pre>`;
+        } else {
+          previewDiv.innerHTML = '<div class="preview-error">No preview available</div>';
+        }
+      } catch (e) {
+        previewDiv.innerHTML = `<div class="preview-error">Preview failed</div>`;
+      }
     });
 
     return fileItem;
@@ -1383,10 +1891,13 @@ function initApp() {
     const aiModuleName = aiSuggested.split("\\").pop();
 
     try {
-      const result = await invoke("move_file", {
-        sourcePath: filePath,
-        destFolder: destFolder,
-      });
+      const moveResult = await moveWithDuplicateCheck(filePath, destFolder, fileData);
+      if (!moveResult.success) {
+        buttonElement.disabled = false;
+        buttonElement.textContent = "Move";
+        if (moveResult.cancelled) showStatus("Move cancelled", "info");
+        return;
+      }
 
       // Log correction: did user agree with AI or pick a different folder?
       if (aiSuggested && destFolder === aiSuggested) {
@@ -1403,7 +1914,8 @@ function initApp() {
 
       removeFileFromUI(filePath, fileItem);
       sendAppNotification("File moved", `${filename} → ${destModuleName}`);
-      showStatus(result, "success");
+      const statusText = moveResult.renamed ? `${moveResult.result} (kept both)` : moveResult.result;
+      showStatus(statusText, "success");
     } catch (error) {
       const errorMsg = error.toString().toLowerCase();
       if (errorMsg.includes("used by another process") || errorMsg.includes("permission denied") || errorMsg.includes("access denied")) {
@@ -1439,10 +1951,13 @@ function initApp() {
     const moduleName = suggestedFolder.split("\\").pop();
 
     try {
-      const result = await invoke("move_file", {
-        sourcePath: filePath,
-        destFolder: suggestedFolder,
-      });
+      const moveResult = await moveWithDuplicateCheck(filePath, suggestedFolder, fileData);
+      if (!moveResult.success) {
+        buttonElement.disabled = false;
+        buttonElement.textContent = "Accept";
+        if (moveResult.cancelled) showStatus("Move cancelled", "info");
+        return;
+      }
 
       // Log as accepted - AI got it right
       logCorrection(filename, moduleName, moduleName, "accepted");
@@ -1454,7 +1969,8 @@ function initApp() {
       showUndoToast(filename, movedDestPath, watchPath);
 
       removeFileFromUI(filePath, fileItem);
-      showStatus(`${result} (AI suggestion accepted)`, "success");
+      const statusText = moveResult.renamed ? `${moveResult.result} (kept both)` : `${moveResult.result} (AI suggestion accepted)`;
+      showStatus(statusText, "success");
     } catch (error) {
       const errorMsg = error.toString().toLowerCase();
       if (errorMsg.includes("used by another process") || errorMsg.includes("permission denied") || errorMsg.includes("access denied")) {
@@ -1489,15 +2005,15 @@ function initApp() {
       if (detectedFiles.length === 0) {
         fileList.innerHTML = '<p class="empty-msg">No files detected yet. Drop a file in your watched folder to test!</p>';
       }
-    }, 300);
+    }, FILE_REMOVE_ANIMATION_MS);
   }
 
   // Retry with exponential backoff then patient waiting
   // onSuccess is an optional callback called after a successful move (before removing from UI)
   async function retryMoveFile(filePath, destFolder, fileItemElement, retryCount, onSuccess) {
-    const quickRetries = 5;
-    const quickDelays = [2000, 5000, 10000, 30000, 60000];
-    const patientDelay = 600000;
+    const quickRetries = QUICK_RETRY_COUNT;
+    const quickDelays = QUICK_RETRY_DELAYS;
+    const patientDelay = PATIENT_RETRY_DELAY_MS;
 
     const suggestionDiv = fileItemElement.querySelector(".ai-suggestion");
     let delay;
@@ -1520,10 +2036,7 @@ function initApp() {
     await new Promise(resolve => setTimeout(resolve, delay));
 
     try {
-      const result = await invoke("move_file", {
-        sourcePath: filePath,
-        destFolder: destFolder,
-      });
+      const result = await moveWithAutoRename(filePath, destFolder);
 
       if (onSuccess) onSuccess(result);
       removeFileFromUI(filePath, fileItemElement);
@@ -1588,7 +2101,7 @@ function initApp() {
       const suggestedFolder = fileItem.getAttribute("data-suggested-folder");
 
       try {
-        await invoke("move_file", { sourcePath: filePath, destFolder: suggestedFolder });
+        await moveWithAutoRename(filePath, suggestedFolder);
 
         const index = detectedFiles.findIndex(f => f.path === filePath);
         const filename = index > -1 ? detectedFiles[index].name : filePath.split("\\").pop();
@@ -1597,7 +2110,7 @@ function initApp() {
         addActivityEntry(filename, watchPath, suggestedFolder);
 
         fileItem.style.opacity = "0";
-        setTimeout(() => fileItem.remove(), 300);
+        setTimeout(() => fileItem.remove(), FILE_REMOVE_ANIMATION_MS);
         successCount++;
       } catch (error) {
         console.error(`Failed to move ${filePath}:`, error);
@@ -1647,7 +2160,7 @@ function initApp() {
       const suggestedFolder = fileItem.getAttribute("data-suggested-folder");
 
       try {
-        await invoke("move_file", { sourcePath: filePath, destFolder: suggestedFolder });
+        await moveWithAutoRename(filePath, suggestedFolder);
 
         const index = detectedFiles.findIndex(f => f.path === filePath);
         const filename = index > -1 ? detectedFiles[index].name : filePath.split("\\").pop();
@@ -1656,7 +2169,7 @@ function initApp() {
         addActivityEntry(filename, watchPath, suggestedFolder);
 
         fileItem.style.opacity = "0";
-        setTimeout(() => fileItem.remove(), 300);
+        setTimeout(() => fileItem.remove(), FILE_REMOVE_ANIMATION_MS);
         successCount++;
       } catch (error) {
         console.error(`Failed to move ${filePath}:`, error);
@@ -1675,7 +2188,7 @@ function initApp() {
       const remainingInBatch = batchContainer.querySelectorAll(".file-item").length;
       if (remainingInBatch === 0) {
         batchContainer.style.opacity = "0";
-        setTimeout(() => batchContainer.remove(), 300);
+        setTimeout(() => batchContainer.remove(), FILE_REMOVE_ANIMATION_MS);
       }
       if (detectedFiles.length === 0) {
         fileList.innerHTML = '<p class="empty-msg">No files detected yet. Drop a file in your watched folder to test!</p>';
@@ -1699,14 +2212,14 @@ function initApp() {
     undoToastMsg.textContent = `Moved "${filename}"`;
     undoToast.style.display = "flex";
 
-    let secondsLeft = UNDO_TIMEOUT / 1000;
+    let secondsLeft = UNDO_TIMEOUT_MS / 1000;
     undoCountdownEl.textContent = secondsLeft;
     undoProgress.style.width = "100%";
 
     undoCountdownInterval = setInterval(() => {
       secondsLeft--;
       undoCountdownEl.textContent = secondsLeft;
-      const pct = (secondsLeft / (UNDO_TIMEOUT / 1000)) * 100;
+      const pct = (secondsLeft / (UNDO_TIMEOUT_MS / 1000)) * 100;
       undoProgress.style.width = pct + "%";
       if (secondsLeft <= 0) {
         cancelUndo();
@@ -1715,7 +2228,7 @@ function initApp() {
 
     undoTimer = setTimeout(() => {
       cancelUndo();
-    }, UNDO_TIMEOUT);
+    }, UNDO_TIMEOUT_MS);
   }
 
   // Cancel undo and hide toast
@@ -1778,7 +2291,16 @@ function initApp() {
         <span class="activity-time">${dateStr} ${timeStr}</span>
         <span class="activity-desc">${escapeHtml(entry.filename)} → <strong>${escapeHtml(toName)}</strong></span>
         ${entry.undone ? '<span class="activity-undone-badge">undone</span>' : ""}
+        <button class="folder-link-btn" title="Open folder in Explorer" aria-label="Open folder in Explorer">&#128193;</button>
       `;
+      item.querySelector(".folder-link-btn").addEventListener("click", async (e) => {
+        e.stopPropagation();
+        try {
+          await openPath(entry.to);
+        } catch (err) {
+          showStatus(`Failed to open folder: ${err}`, "error");
+        }
+      });
       activityList.appendChild(item);
     }
 
@@ -1790,12 +2312,7 @@ function initApp() {
     }
   }
 
-  function isToday(date) {
-    const now = new Date();
-    return date.getDate() === now.getDate() &&
-      date.getMonth() === now.getMonth() &&
-      date.getFullYear() === now.getFullYear();
-  }
+  // isToday is imported from utils.js
 
   // Show status message
   function showStatus(message, type = "info") {
@@ -1806,48 +2323,69 @@ function initApp() {
         statusMsg.textContent = "";
         statusMsg.className = "status-msg";
       }
-    }, 5000);
+    }, STATUS_TIMEOUT_MS);
+  }
+
+  // Show duplicate file conflict dialog — returns "keep-both" or "cancel"
+  function showDuplicateDialog(filename) {
+    return new Promise((resolve) => {
+      const overlay = document.createElement("div");
+      overlay.className = "dialog-overlay";
+      overlay.innerHTML = `
+        <div class="dialog-box">
+          <h3>File Already Exists</h3>
+          <p>A file named <strong>${escapeHtml(filename)}</strong> already exists in the destination folder.</p>
+          <div class="dialog-actions">
+            <button class="dialog-btn dialog-btn-primary" data-action="keep-both">Keep Both</button>
+            <button class="dialog-btn dialog-btn-secondary" data-action="cancel">Cancel</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(overlay);
+      overlay.addEventListener("click", (e) => {
+        const action = e.target.getAttribute("data-action");
+        if (action) {
+          overlay.remove();
+          resolve(action);
+        }
+      });
+    });
+  }
+
+  // Move file with duplicate detection — interactive (shows dialog)
+  async function moveWithDuplicateCheck(sourcePath, destFolder, fileData) {
+    try {
+      const result = await invoke("move_file", { sourcePath, destFolder });
+      return { success: true, result };
+    } catch (error) {
+      const errorMsg = error.toString();
+      if (errorMsg.includes("File already exists at destination")) {
+        const filename = fileData?.name || sourcePath.split("\\").pop();
+        const action = await showDuplicateDialog(filename);
+        if (action === "keep-both") {
+          const result = await invoke("move_file_with_rename", { sourcePath, destFolder });
+          return { success: true, result, renamed: true };
+        }
+        return { success: false, cancelled: true };
+      }
+      throw error;
+    }
+  }
+
+  // Move file with silent auto-rename on duplicate (for auto-move / batch / retry)
+  async function moveWithAutoRename(sourcePath, destFolder) {
+    try {
+      const result = await invoke("move_file", { sourcePath, destFolder });
+      return result;
+    } catch (error) {
+      const errorMsg = error.toString();
+      if (errorMsg.includes("File already exists at destination")) {
+        return await invoke("move_file_with_rename", { sourcePath, destFolder });
+      }
+      throw error;
+    }
   }
 }
 
-// ============================================================
-// UTILITY
-// ============================================================
-function formatFileSize(bytes) {
-  if (bytes === 0) return "0 Bytes";
-  const k = 1024;
-  const sizes = ["Bytes", "KB", "MB", "GB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return Math.round(bytes / Math.pow(k, i) * 100) / 100 + " " + sizes[i];
-}
-
-function escapeHtml(str) {
-  const div = document.createElement("div");
-  div.textContent = str;
-  return div.innerHTML;
-}
-
-// Validate module name: no path traversal, no invalid Windows filename chars
-function validateModuleName(name) {
-  if (!name || name.trim().length === 0) {
-    return "Module name cannot be empty";
-  }
-  // Block path traversal
-  if (name.includes("..") || name.includes("/") || name.includes("\\")) {
-    return "Module name cannot contain path separators or '..'";
-  }
-  // Block Windows-invalid filename characters
-  const invalidChars = /[<>:"|?*]/;
-  if (invalidChars.test(name)) {
-    return "Module name cannot contain < > : \" | ? *";
-  }
-  // Block names that are just dots
-  if (/^\.+$/.test(name.trim())) {
-    return "Module name cannot be just dots";
-  }
-  // Block excessively long names
-  if (name.trim().length > 100) {
-    return "Module name is too long (max 100 characters)";
-  }
-  return null; // valid
-}
+// Utility functions (formatFileSize, escapeHtml, validateModuleName)
+// are imported from utils.js

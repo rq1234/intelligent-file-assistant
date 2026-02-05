@@ -3,10 +3,71 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ClassifierError {
+    #[error("OPENAI_API_KEY not set in environment")]
+    MissingApiKey,
+
+    #[error("Failed to create HTTP client: {0}")]
+    HttpClient(#[from] reqwest::Error),
+
+    #[error("OpenAI API error (status {0})")]
+    ApiStatus(reqwest::StatusCode),
+
+    #[error("OpenAI returned no choices")]
+    NoChoices,
+
+    #[error("Failed to parse GPT JSON response: {source}. Content: {content}")]
+    ParseJson {
+        source: serde_json::Error,
+        content: String,
+    },
+
+    #[error("Failed to read file: {0}")]
+    FileRead(#[source] std::io::Error),
+
+    #[error("Image file too large ({actual_mb:.1} MB). Maximum is {max_mb} MB.")]
+    ImageTooLarge { actual_mb: f64, max_mb: u64 },
+
+    #[error("Failed to extract PDF text: {0}")]
+    PdfExtract(String),
+
+    #[error("Failed to load image for OCR: {0}")]
+    OcrLoad(String),
+
+    #[error("OCR extraction failed: {0}")]
+    OcrExtract(String),
+}
+
+// Convert ClassifierError to String for Tauri command compatibility
+impl From<ClassifierError> for String {
+    fn from(err: ClassifierError) -> String {
+        err.to_string()
+    }
+}
 
 const API_TIMEOUT_SECS: u64 = 30;
 const MAX_IMAGE_SIZE_BYTES: u64 = 20 * 1024 * 1024; // 20 MB
+const MIN_API_INTERVAL_MS: u64 = 500; // Minimum 500ms between API calls
+
+/// Simple rate limiter to prevent rapid-fire API calls
+static LAST_API_CALL: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn rate_limit() {
+    let mut last = LAST_API_CALL.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(prev) = *last {
+        let elapsed = prev.elapsed();
+        let min_interval = Duration::from_millis(MIN_API_INTERVAL_MS);
+        if elapsed < min_interval {
+            std::thread::sleep(min_interval - elapsed);
+        }
+    }
+    *last = Some(Instant::now());
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Classification {
@@ -121,8 +182,8 @@ Use these examples to improve your accuracy. If a similar filename appears, appl
             String::new(),
         ),
         PromptMode::TextContent(text) => (
-            "The filename alone was not enough to classify this file. Use the extracted text content below to determine what subject/course this file belongs to.".to_string(),
-            format!("\n\nExtracted text content (first ~500 chars):\n{}", text),
+            "IMPORTANT: Classify this file based PRIMARILY on the extracted text content below, NOT the filename. The filename may be generic (like 'PS2.pdf' or 'notes.pdf') but the actual content reveals the subject. Look for subject-specific keywords, course names, topics, formulas, or terminology in the extracted text to determine the correct folder.".to_string(),
+            format!("\n\nExtracted text content (PRIORITIZE THIS for classification):\n{}", text),
         ),
         PromptMode::FilenameOnly => (
             "Given a filename, first decide if it is educational/coursework material, then suggest the best folder.".to_string(),
@@ -149,7 +210,8 @@ Respond with ONLY a JSON object in this format:
 Rules:
 - is_relevant: true if the file is educational material (lecture slides, notes, assignments, textbooks, academic papers, course-related documents, ChatGPT conversations about coursework, screenshots of lecture content, screenshots of formulas/equations, screenshots of code/tutorials, screenshots of academic websites or textbook pages). Set false for memes, entertainment, games, personal photos, installers, music, videos unrelated to courses, social media content, screenshots of non-academic things like social media or shopping, etc.
 - If is_relevant is false, set folder to "" and confidence to 0
-- If is_relevant is true, use exact folder paths from the available list
+- If is_relevant is true and the file clearly belongs to one of the available folders, use the exact folder path from the list
+- If is_relevant is true but the file does NOT fit any of the available folders, set folder to "__UNSORTED__" — do NOT force-fit it into an unrelated folder
 - confidence should be 0-1 (1 = very confident)
 - Consider file extension, name patterns, and common use cases
 - Be concise in reasoning{corrections}"#,
@@ -162,7 +224,7 @@ Rules:
 }
 
 /// Parse the GPT response JSON into a Classification
-fn parse_response(content: &str) -> Result<Classification, String> {
+fn parse_response(content: &str) -> Result<Classification, ClassifierError> {
     let json_str = if content.contains("```json") {
         content
             .split("```json")
@@ -181,30 +243,48 @@ fn parse_response(content: &str) -> Result<Classification, String> {
     };
 
     let gpt_response: GptResponse = serde_json::from_str(json_str)
-        .map_err(|e| format!("Failed to parse GPT JSON response: {}. Content: {}", e, json_str))?;
+        .map_err(|e| ClassifierError::ParseJson {
+            source: e,
+            content: json_str.to_string(),
+        })?;
 
     // Clamp confidence to [0.0, 1.0] range
     let confidence = gpt_response.confidence.clamp(0.0, 1.0);
 
     Ok(Classification {
-        is_relevant: gpt_response.is_relevant.unwrap_or(true),
+        is_relevant: gpt_response.is_relevant.unwrap_or(false),
         suggested_folder: gpt_response.folder,
         confidence,
         reasoning: gpt_response.reasoning,
     })
 }
 
-/// Classify a file using filename only (GPT-3.5-turbo)
-pub async fn classify_file(
-    filename: String,
-    available_folders: Vec<String>,
-    correction_history: Vec<String>,
-) -> Result<Classification, String> {
-    let api_key = env::var("OPENAI_API_KEY")
-        .map_err(|_| "OPENAI_API_KEY not set in environment".to_string())?;
+/// Handle an OpenAI API response: check status, parse JSON, extract classification
+async fn handle_api_response(response: reqwest::Response) -> Result<Classification, ClassifierError> {
+    if !response.status().is_success() {
+        let status = response.status();
+        let _error_text = response.text().await.unwrap_or_default();
+        return Err(ClassifierError::ApiStatus(status));
+    }
 
-    let prompt = build_prompt(&filename, &available_folders, &correction_history, PromptMode::FilenameOnly);
+    let api_response: OpenAIResponse = response
+        .json()
+        .await
+        .map_err(ClassifierError::HttpClient)?;
 
+    if api_response.choices.is_empty() {
+        return Err(ClassifierError::NoChoices);
+    }
+
+    parse_response(&api_response.choices[0].message.content)
+}
+
+/// Send a text-based request to the OpenAI chat completions API and parse the response
+async fn send_text_request(
+    api_key: &str,
+    prompt: String,
+    timeout_secs: u64,
+) -> Result<Classification, ClassifierError> {
     let request = TextRequest {
         model: "gpt-3.5-turbo".to_string(),
         messages: vec![TextMessage {
@@ -214,10 +294,12 @@ pub async fn classify_file(
         temperature: 0.3,
     };
 
+    rate_limit();
+
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(API_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(timeout_secs))
         .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        .map_err(ClassifierError::HttpClient)?;
     let response = client
         .post("https://api.openai.com/v1/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key))
@@ -225,24 +307,23 @@ pub async fn classify_file(
         .json(&request)
         .send()
         .await
-        .map_err(|e| format!("Failed to call OpenAI API: {}", e))?;
+        .map_err(ClassifierError::HttpClient)?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let _error_text = response.text().await.unwrap_or_default();
-        return Err(format!("OpenAI API error (status {})", status));
-    }
+    handle_api_response(response).await
+}
 
-    let api_response: OpenAIResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse OpenAI response: {}", e))?;
+/// Classify a file using filename only (GPT-3.5-turbo)
+pub async fn classify_file(
+    filename: String,
+    available_folders: Vec<String>,
+    correction_history: Vec<String>,
+) -> Result<Classification, String> {
+    let api_key = env::var("OPENAI_API_KEY")
+        .map_err(|_| ClassifierError::MissingApiKey)?;
 
-    if api_response.choices.is_empty() {
-        return Err("OpenAI returned no choices".to_string());
-    }
+    let prompt = build_prompt(&filename, &available_folders, &correction_history, PromptMode::FilenameOnly);
 
-    parse_response(&api_response.choices[0].message.content)
+    send_text_request(&api_key, prompt, API_TIMEOUT_SECS).await.map_err(|e| e.to_string())
 }
 
 /// Classify an image file using GPT-4o vision
@@ -255,23 +336,33 @@ pub async fn classify_image_file(
     available_folders: Vec<String>,
     correction_history: Vec<String>,
 ) -> Result<Classification, String> {
+    classify_image_file_impl(file_path, filename, available_folders, correction_history)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn classify_image_file_impl(
+    file_path: String,
+    filename: String,
+    available_folders: Vec<String>,
+    correction_history: Vec<String>,
+) -> Result<Classification, ClassifierError> {
     let api_key = env::var("OPENAI_API_KEY")
-        .map_err(|_| "OPENAI_API_KEY not set in environment".to_string())?;
+        .map_err(|_| ClassifierError::MissingApiKey)?;
 
     // Check file size before reading
     let metadata = std::fs::metadata(&file_path)
-        .map_err(|e| format!("Failed to read image metadata: {}", e))?;
+        .map_err(ClassifierError::FileRead)?;
     if metadata.len() > MAX_IMAGE_SIZE_BYTES {
-        return Err(format!(
-            "Image file too large ({:.1} MB). Maximum is {} MB.",
-            metadata.len() as f64 / (1024.0 * 1024.0),
-            MAX_IMAGE_SIZE_BYTES / (1024 * 1024)
-        ));
+        return Err(ClassifierError::ImageTooLarge {
+            actual_mb: metadata.len() as f64 / (1024.0 * 1024.0),
+            max_mb: MAX_IMAGE_SIZE_BYTES / (1024 * 1024),
+        });
     }
 
     // Read and base64-encode the image
     let image_bytes = std::fs::read(&file_path)
-        .map_err(|e| format!("Failed to read image file: {}", e))?;
+        .map_err(ClassifierError::FileRead)?;
 
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
 
@@ -307,10 +398,12 @@ pub async fn classify_image_file(
         max_tokens: 300,
     };
 
+    rate_limit();
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(API_TIMEOUT_SECS * 2)) // Vision needs more time
         .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        .map_err(ClassifierError::HttpClient)?;
     let response = client
         .post("https://api.openai.com/v1/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key))
@@ -318,33 +411,18 @@ pub async fn classify_image_file(
         .json(&request)
         .send()
         .await
-        .map_err(|e| format!("Failed to call OpenAI Vision API: {}", e))?;
+        .map_err(ClassifierError::HttpClient)?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let _error_text = response.text().await.unwrap_or_default();
-        return Err(format!("OpenAI Vision API error (status {})", status));
-    }
-
-    let api_response: OpenAIResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse OpenAI Vision response: {}", e))?;
-
-    if api_response.choices.is_empty() {
-        return Err("OpenAI Vision returned no choices".to_string());
-    }
-
-    parse_response(&api_response.choices[0].message.content)
+    handle_api_response(response).await
 }
 
 /// Extract text from a PDF file (first ~500 chars)
 pub fn extract_pdf_text(file_path: &str) -> Result<String, String> {
     let bytes = std::fs::read(file_path)
-        .map_err(|e| format!("Failed to read PDF: {}", e))?;
+        .map_err(|e| ClassifierError::FileRead(e).to_string())?;
 
     let text = pdf_extract::extract_text_from_mem(&bytes)
-        .map_err(|e| format!("Failed to extract PDF text: {}", e))?;
+        .map_err(|e| ClassifierError::PdfExtract(e.to_string()).to_string())?;
 
     // Take first ~500 chars, clean up whitespace
     let cleaned: String = text
@@ -395,10 +473,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_missing_is_relevant_defaults_to_true() {
+    fn test_parse_missing_is_relevant_defaults_to_false() {
         let content = r#"{"folder": "Physics", "confidence": 0.9, "reasoning": "physics homework"}"#;
         let result = parse_response(content).unwrap();
-        assert!(result.is_relevant); // defaults to true when missing
+        assert!(!result.is_relevant); // defaults to false when missing (safer)
         assert_eq!(result.suggested_folder, "Physics");
     }
 
@@ -407,7 +485,7 @@ mod tests {
         let content = "not json at all";
         let result = parse_response(content);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Failed to parse GPT JSON response"));
+        assert!(result.unwrap_err().to_string().contains("Failed to parse GPT JSON response"));
     }
 
     #[test]
@@ -481,7 +559,8 @@ mod tests {
 
         assert!(prompt.contains("Extracted text content"));
         assert!(prompt.contains("Integration by parts formula"));
-        assert!(prompt.contains("filename alone was not enough"));
+        assert!(prompt.contains("PRIORITIZE THIS for classification"));
+        assert!(prompt.contains("based PRIMARILY on the extracted text content"));
     }
 
     #[test]
@@ -607,7 +686,7 @@ mod tests {
 /// Returns the extracted text (first ~500 chars), or an error if OCR fails
 pub fn extract_image_text(file_path: &str) -> Result<String, String> {
     let img = rusty_tesseract::Image::from_path(file_path)
-        .map_err(|e| format!("Failed to load image for OCR: {}", e))?;
+        .map_err(|e| ClassifierError::OcrLoad(e.to_string()).to_string())?;
 
     let args = rusty_tesseract::Args {
         lang: "eng".to_string(),
@@ -615,7 +694,7 @@ pub fn extract_image_text(file_path: &str) -> Result<String, String> {
     };
 
     let text = rusty_tesseract::image_to_string(&img, &args)
-        .map_err(|e| format!("OCR extraction failed: {}", e))?;
+        .map_err(|e| ClassifierError::OcrExtract(e.to_string()).to_string())?;
 
     // Clean up and take first ~500 chars
     let cleaned: String = text
@@ -639,7 +718,7 @@ pub async fn classify_with_text_content(
     correction_history: Vec<String>,
 ) -> Result<Classification, String> {
     let api_key = env::var("OPENAI_API_KEY")
-        .map_err(|_| "OPENAI_API_KEY not set in environment".to_string())?;
+        .map_err(|_| ClassifierError::MissingApiKey)?;
 
     let prompt = build_prompt(
         &filename,
@@ -648,42 +727,5 @@ pub async fn classify_with_text_content(
         PromptMode::TextContent(text_content),
     );
 
-    let request = TextRequest {
-        model: "gpt-3.5-turbo".to_string(),
-        messages: vec![TextMessage {
-            role: "user".to_string(),
-            content: prompt,
-        }],
-        temperature: 0.3,
-    };
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(API_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-    let response = client
-        .post("https://api.openai.com/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to call OpenAI API: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let _error_text = response.text().await.unwrap_or_default();
-        return Err(format!("OpenAI API error (status {})", status));
-    }
-
-    let api_response: OpenAIResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse OpenAI response: {}", e))?;
-
-    if api_response.choices.is_empty() {
-        return Err("OpenAI returned no choices".to_string());
-    }
-
-    parse_response(&api_response.choices[0].message.content)
+    send_text_request(&api_key, prompt, API_TIMEOUT_SECS).await.map_err(|e| e.to_string())
 }
