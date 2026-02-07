@@ -16,6 +16,7 @@ export const STORAGE_KEYS = {
   lastScanFolder: "fileorg_last_scan_folder",
   windowState: "fileorg_window_state",
   theme: "fileorg_theme",
+  apiKey: "fileorg_api_key",
 };
 
 // Limits

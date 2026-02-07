@@ -314,12 +314,16 @@ async fn send_text_request(
 
 /// Classify a file using filename only (GPT-3.5-turbo)
 pub async fn classify_file(
+    api_key: String,
     filename: String,
     available_folders: Vec<String>,
     correction_history: Vec<String>,
 ) -> Result<Classification, String> {
-    let api_key = env::var("OPENAI_API_KEY")
-        .map_err(|_| ClassifierError::MissingApiKey)?;
+    let api_key = if api_key.is_empty() {
+        env::var("OPENAI_API_KEY").map_err(|_| ClassifierError::MissingApiKey.to_string())?
+    } else {
+        api_key
+    };
 
     let prompt = build_prompt(&filename, &available_folders, &correction_history, PromptMode::FilenameOnly);
 
@@ -331,24 +335,29 @@ pub async fn classify_file(
 /// Reads the image, base64-encodes it, and sends it to GPT-4o
 /// so the AI can see the actual content (math, text, diagrams, etc.)
 pub async fn classify_image_file(
+    api_key: String,
     file_path: String,
     filename: String,
     available_folders: Vec<String>,
     correction_history: Vec<String>,
 ) -> Result<Classification, String> {
-    classify_image_file_impl(file_path, filename, available_folders, correction_history)
+    classify_image_file_impl(api_key, file_path, filename, available_folders, correction_history)
         .await
         .map_err(|e| e.to_string())
 }
 
 async fn classify_image_file_impl(
+    api_key: String,
     file_path: String,
     filename: String,
     available_folders: Vec<String>,
     correction_history: Vec<String>,
 ) -> Result<Classification, ClassifierError> {
-    let api_key = env::var("OPENAI_API_KEY")
-        .map_err(|_| ClassifierError::MissingApiKey)?;
+    let api_key = if api_key.is_empty() {
+        env::var("OPENAI_API_KEY").map_err(|_| ClassifierError::MissingApiKey)?
+    } else {
+        api_key
+    };
 
     // Check file size before reading
     let metadata = std::fs::metadata(&file_path)
@@ -712,13 +721,17 @@ pub fn extract_image_text(file_path: &str) -> Result<String, String> {
 ///
 /// Used as a second pass when filename-only classification has low confidence
 pub async fn classify_with_text_content(
+    api_key: String,
     filename: String,
     text_content: String,
     available_folders: Vec<String>,
     correction_history: Vec<String>,
 ) -> Result<Classification, String> {
-    let api_key = env::var("OPENAI_API_KEY")
-        .map_err(|_| ClassifierError::MissingApiKey)?;
+    let api_key = if api_key.is_empty() {
+        env::var("OPENAI_API_KEY").map_err(|_| ClassifierError::MissingApiKey.to_string())?
+    } else {
+        api_key
+    };
 
     let prompt = build_prompt(
         &filename,

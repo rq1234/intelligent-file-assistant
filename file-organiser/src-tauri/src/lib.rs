@@ -274,16 +274,17 @@ fn move_file_with_rename(source_path: String, dest_folder: String) -> Result<Str
 
 /// Classify a file using AI
 ///
-/// Called from frontend with: invoke('classify_file', { filename: '...', availableFolders: [...], correctionHistory: [...] })
+/// Called from frontend with: invoke('classify_file', { apiKey: '...', filename: '...', availableFolders: [...], correctionHistory: [...] })
 #[tauri::command]
 async fn classify_file(
+    api_key: String,
     filename: String,
     available_folders: Vec<String>,
     correction_history: Vec<String>,
 ) -> Result<classifier::Classification, String> {
     println!("[COMMAND] classify_file: {} (with {} corrections)", filename, correction_history.len());
 
-    classifier::classify_file(filename, available_folders, correction_history).await
+    classifier::classify_file(api_key, filename, available_folders, correction_history).await
 }
 
 /// Classify an image file using OCR text extraction + GPT-3.5 (cheap path)
@@ -292,6 +293,7 @@ async fn classify_file(
 /// Returns error if OCR extracts too little text (caller should fall back to vision).
 #[tauri::command]
 async fn classify_image_with_ocr(
+    api_key: String,
     file_path: String,
     filename: String,
     available_folders: Vec<String>,
@@ -309,14 +311,15 @@ async fn classify_image_with_ocr(
 
     println!("[COMMAND] OCR extracted {} chars from {}", text_content.len(), filename);
 
-    classifier::classify_with_text_content(filename, text_content, available_folders, correction_history).await
+    classifier::classify_with_text_content(api_key, filename, text_content, available_folders, correction_history).await
 }
 
 /// Classify an image file using GPT-4o vision (reads actual image content)
 ///
-/// Called from frontend with: invoke('classify_image_file', { filePath: '...', filename: '...', availableFolders: [...], correctionHistory: [...] })
+/// Called from frontend with: invoke('classify_image_file', { apiKey: '...', filePath: '...', filename: '...', availableFolders: [...], correctionHistory: [...] })
 #[tauri::command]
 async fn classify_image_file(
+    api_key: String,
     file_path: String,
     filename: String,
     available_folders: Vec<String>,
@@ -324,7 +327,7 @@ async fn classify_image_file(
 ) -> Result<classifier::Classification, String> {
     println!("[COMMAND] classify_image_file: {} (vision mode)", filename);
 
-    classifier::classify_image_file(file_path, filename, available_folders, correction_history).await
+    classifier::classify_image_file(api_key, file_path, filename, available_folders, correction_history).await
 }
 
 /// Classify a file using extracted text content (second pass for PDFs, etc.)
@@ -332,6 +335,7 @@ async fn classify_image_file(
 /// Called from frontend with: invoke('classify_with_content', { filePath: '...', filename: '...', availableFolders: [...], correctionHistory: [...] })
 #[tauri::command]
 async fn classify_with_content(
+    api_key: String,
     file_path: String,
     filename: String,
     available_folders: Vec<String>,
@@ -361,7 +365,7 @@ async fn classify_with_content(
         return Err("No text content could be extracted from the file".to_string());
     }
 
-    classifier::classify_with_text_content(filename, text_content, available_folders, correction_history).await
+    classifier::classify_with_text_content(api_key, filename, text_content, available_folders, correction_history).await
 }
 
 /// Scan a directory and return list of subdirectories
