@@ -62,6 +62,7 @@ let autoMoveThreshold = 0.9;
 let notificationsEnabled = false;
 let notificationApi = null;
 let darkModeEnabled = false;
+let userApiKey = "";
 
 function applyTheme() {
   document.documentElement.setAttribute("data-theme", darkModeEnabled ? "dark" : "light");
@@ -171,6 +172,8 @@ async function loadSavedConfig() {
       darkModeEnabled = window.matchMedia("(prefers-color-scheme: dark)").matches;
     }
     applyTheme();
+    const savedApiKey = localStorage.getItem(STORAGE_KEYS.apiKey);
+    if (savedApiKey) userApiKey = savedApiKey;
   } catch (e) {
     console.error("Failed to load saved config:", e);
   }
@@ -181,6 +184,14 @@ async function initNotifications() {
   try {
     const mod = await import("@tauri-apps/plugin-notification");
     notificationApi = mod;
+
+    // When user clicks a notification, bring the app window to focus
+    mod.onAction(() => {
+      const appWindow = getCurrentWindow();
+      appWindow.show();
+      appWindow.unminimize();
+      appWindow.setFocus();
+    });
 
     if (notificationsEnabled) {
       const granted = await mod.isPermissionGranted();
@@ -466,6 +477,9 @@ function initSettings() {
   const notificationsToggle = document.getElementById("settings-notifications-toggle");
   const notificationHint = document.getElementById("notification-permission-hint");
   const darkModeToggle = document.getElementById("settings-dark-mode-toggle");
+  const apiKeyInput = document.getElementById("settings-api-key");
+  const toggleKeyBtn = document.getElementById("settings-toggle-key-btn");
+  const apiKeyStatus = document.getElementById("api-key-status");
   const saveBtn = document.getElementById("settings-save-btn");
   const settingsStatus = document.getElementById("settings-status");
 
@@ -478,6 +492,7 @@ function initSettings() {
     localStorage.setItem(STORAGE_KEYS.autoMoveThreshold, String(autoMoveThreshold));
     localStorage.setItem(STORAGE_KEYS.notificationsEnabled, String(notificationsEnabled));
     localStorage.setItem(STORAGE_KEYS.theme, darkModeEnabled ? "dark" : "light");
+    localStorage.setItem(STORAGE_KEYS.apiKey, userApiKey);
   }
 
   // Populate current values (working directly with global state)
@@ -490,6 +505,31 @@ function initSettings() {
   thresholdValue.textContent = Math.round(autoMoveThreshold * 100) + "%";
   thresholdGroup.style.display = autoMoveEnabled ? "block" : "none";
   darkModeToggle.checked = darkModeEnabled;
+  apiKeyInput.value = userApiKey;
+  apiKeyStatus.textContent = userApiKey ? "Key saved" : "";
+  apiKeyStatus.style.color = userApiKey ? "var(--success)" : "";
+
+  // API key show/hide toggle
+  toggleKeyBtn.addEventListener("click", () => {
+    const isPassword = apiKeyInput.type === "password";
+    apiKeyInput.type = isPassword ? "text" : "password";
+    toggleKeyBtn.textContent = isPassword ? "Hide" : "Show";
+  });
+
+  // Save API key on blur (when user clicks away from the field)
+  apiKeyInput.addEventListener("change", () => {
+    const val = apiKeyInput.value.trim();
+    userApiKey = val;
+    autoSaveSettings();
+    if (val) {
+      apiKeyStatus.textContent = "Key saved";
+      apiKeyStatus.style.color = "var(--success)";
+    } else {
+      apiKeyStatus.textContent = "No key set - AI classification will not work";
+      apiKeyStatus.style.color = "var(--warning)";
+    }
+  });
+
   renderSettingsModuleList();
 
   // Dark mode toggle - clone switch to remove old handlers
@@ -1351,6 +1391,7 @@ function initApp() {
     // Pass 1: Filename-based classification
     if (statusCallback) statusCallback("Analyzing filename...");
     const firstPass = await invoke("classify_file", {
+      apiKey: userApiKey,
       filename: fileInfo.name,
       availableFolders: availableFolders,
       correctionHistory: correctionHistory,
@@ -1380,6 +1421,7 @@ function initApp() {
       if (statusCallback) statusCallback("Filename unclear - extracting text from image (OCR)...");
       try {
         return await invoke("classify_image_with_ocr", {
+          apiKey: userApiKey,
           filePath: fileInfo.path,
           filename: fileInfo.name,
           availableFolders: availableFolders,
@@ -1396,6 +1438,7 @@ function initApp() {
         if (statusCallback) statusCallback("OCR insufficient - analyzing with AI vision...");
         try {
           return await invoke("classify_image_file", {
+            apiKey: userApiKey,
             filePath: fileInfo.path,
             filename: fileInfo.name,
             availableFolders: availableFolders,
@@ -1413,6 +1456,7 @@ function initApp() {
       if (statusCallback) statusCallback("Filename unclear - reading file content for better classification...");
       try {
         return await invoke("classify_with_content", {
+          apiKey: userApiKey,
           filePath: fileInfo.path,
           filename: fileInfo.name,
           availableFolders: availableFolders,
