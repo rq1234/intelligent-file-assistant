@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main, feature/*]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            file-organiser/src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('file-organiser/src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install npm dependencies
+        working-directory: file-organiser
+        run: npm install
+
+      - name: Run JS tests
+        working-directory: file-organiser
+        run: node src/main.test.js
+
+      - name: Run Rust tests
+        working-directory: file-organiser/src-tauri
+        run: cargo test
+
+      - name: Build app
+        working-directory: file-organiser
+        run: npm run build

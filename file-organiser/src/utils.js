@@ -143,6 +143,72 @@ export function buildCorrectionHistory(correctionLog) {
   return lines;
 }
 
+// Get a file type icon (emoji) based on file extension
+export function getFileTypeIcon(filename) {
+  const ext = getFileExt(filename);
+  const icons = {
+    pdf: "\u{1F4C4}",
+    doc: "\u{1F4DD}", docx: "\u{1F4DD}",
+    ppt: "\u{1F4CA}", pptx: "\u{1F4CA}",
+    xls: "\u{1F4C8}", xlsx: "\u{1F4C8}",
+    png: "\u{1F5BC}\uFE0F", jpg: "\u{1F5BC}\uFE0F", jpeg: "\u{1F5BC}\uFE0F",
+    gif: "\u{1F5BC}\uFE0F", webp: "\u{1F5BC}\uFE0F", bmp: "\u{1F5BC}\uFE0F",
+    txt: "\u{1F4C3}", md: "\u{1F4C3}", csv: "\u{1F4C3}",
+    zip: "\u{1F4E6}", rar: "\u{1F4E6}", "7z": "\u{1F4E6}",
+    py: "\u{1F4BB}", js: "\u{1F4BB}", rs: "\u{1F4BB}",
+    java: "\u{1F4BB}", cpp: "\u{1F4BB}", c: "\u{1F4BB}",
+  };
+  return icons[ext] || "\u{1F4CE}";
+}
+
+// Check cache: if we've classified this exact filename before and the user accepted/corrected it,
+// return a synthetic classification result to skip the API call.
+export function getCachedClassification(filename, correctionLog, userModules, basePath) {
+  const cached = correctionLog.find(
+    c => c.filename === filename && (c.type === "accepted" || c.type === "corrected")
+  );
+  if (!cached) return null;
+  const folder = userModules.find(m => m.toLowerCase() === cached.userChose.toLowerCase());
+  if (!folder) return null; // folder was deleted
+  return {
+    is_relevant: true,
+    suggested_folder: pathJoin(basePath, folder),
+    confidence: 1.0,
+    reasoning: "Previously classified by you",
+  };
+}
+
+// Match a filename against user-defined rules (glob patterns).
+// Returns a synthetic classification result or null.
+export function matchRule(filename, rules) {
+  for (const rule of rules) {
+    const regex = new RegExp("^" + rule.pattern.replace(/[.+^${}()|[\]]/g, "\\$&").replace(/\*/g, ".*") + "$", "i");
+    if (regex.test(filename)) {
+      return {
+        is_relevant: true,
+        suggested_folder: rule.target_folder,
+        confidence: 1.0,
+        reasoning: `Matched rule: ${rule.pattern}`,
+      };
+    }
+  }
+  return null;
+}
+
+// Cross-platform path join: detects separator from base path and joins parts.
+// On Windows, basePath from Tauri dialogs uses backslashes; on macOS/Linux, forward slashes.
+export function pathJoin(base, ...parts) {
+  const sep = base.includes("\\") ? "\\" : "/";
+  return [base, ...parts].filter(Boolean).join(sep);
+}
+
+// Cross-platform path basename: extracts the last component from a path.
+// Handles both backslash (Windows) and forward slash (macOS/Linux).
+export function pathBasename(filePath) {
+  const parts = filePath.split(/[\\/]/);
+  return parts[parts.length - 1] || "";
+}
+
 // Filter out files already tracked in detected/skipped/ignored lists
 export function filterNewFiles(scannedFiles, detectedFiles, skippedFiles, ignoredFiles) {
   const existingPaths = new Set([

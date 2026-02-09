@@ -35,4 +35,5 @@ rusty-tesseract = "1"  # OCR text extraction from images
 trash = "3"  # Send files to system recycle bin
 thiserror = "1"  # Derive macro for error types
 rusqlite = { version = "0.31", features = ["bundled"] }  # SQLite database
+tauri-plugin-autostart = "2"  # Launch app on system startup
 

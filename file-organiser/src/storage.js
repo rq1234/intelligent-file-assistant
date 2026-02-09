@@ -1,7 +1,7 @@
 // Storage abstraction layer for SQLite database
 // Provides async functions to interact with the Rust backend database
 
-const { invoke } = window.__TAURI__.core;
+import { invoke } from "@tauri-apps/api/core";
 
 // Migration flag key in localStorage
 const MIGRATION_DONE_KEY = "fileorg_sqlite_migrated";
@@ -71,14 +71,16 @@ export async function clearCorrections() {
  * @param {string} filename - The file that was moved
  * @param {string} fromFolder - Source folder path
  * @param {string} toFolder - Destination folder path
+ * @param {string|null} [originalFilename=null] - Original filename before rename (if renamed)
  * @returns {Promise<Object|null>} The created entry or null on failure
  */
-export async function addActivity(filename, fromFolder, toFolder) {
+export async function addActivity(filename, fromFolder, toFolder, originalFilename = null) {
   try {
     await invoke("db_add_activity", {
       filename,
       fromFolder,
       toFolder,
+      originalFilename,
     });
     // Return the entry in the format expected by the frontend
     return {
@@ -87,6 +89,7 @@ export async function addActivity(filename, fromFolder, toFolder) {
       to: toFolder,
       timestamp: Date.now(),
       undone: false,
+      originalFilename,
     };
   } catch (e) {
     console.error("[Storage] Failed to add activity:", e);
@@ -108,6 +111,7 @@ export async function getActivityLog() {
       to: e.to_folder,
       timestamp: e.created_at,
       undone: e.undone,
+      originalFilename: e.original_filename || null,
     }));
   } catch (e) {
     console.error("[Storage] Failed to get activity log:", e);
@@ -135,6 +139,55 @@ export async function clearActivityLog() {
     await invoke("db_clear_activity_log");
   } catch (e) {
     console.error("[Storage] Failed to clear activity log:", e);
+  }
+}
+
+// ============================================================
+// CLASSIFICATION RULES
+// ============================================================
+
+/**
+ * Add a classification rule
+ * @param {string} pattern - Glob pattern (e.g. "*_ML_*", "Lecture*")
+ * @param {string} targetFolder - Full path to target folder
+ * @returns {Promise<number|null>} The rule id or null on failure
+ */
+export async function addRule(pattern, targetFolder) {
+  try {
+    return await invoke("db_add_rule", { pattern, targetFolder });
+  } catch (e) {
+    console.error("[Storage] Failed to add rule:", e);
+    return null;
+  }
+}
+
+/**
+ * Get all classification rules
+ * @returns {Promise<Array>} Array of rule objects { id, pattern, target_folder }
+ */
+export async function getRules() {
+  try {
+    const rules = await invoke("db_get_rules");
+    return rules.map((r) => ({
+      id: r.id,
+      pattern: r.pattern,
+      target_folder: r.target_folder,
+    }));
+  } catch (e) {
+    console.error("[Storage] Failed to get rules:", e);
+    return [];
+  }
+}
+
+/**
+ * Delete a classification rule by id
+ * @param {number} id - The rule id to delete
+ */
+export async function deleteRule(id) {
+  try {
+    await invoke("db_delete_rule", { id });
+  } catch (e) {
+    console.error("[Storage] Failed to delete rule:", e);
   }
 }
 

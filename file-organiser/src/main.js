@@ -1,8 +1,8 @@
-const { invoke } = window.__TAURI__.core;
-const { listen } = window.__TAURI__.event;
-const { open } = window.__TAURI__.dialog;
-const { getCurrentWindow } = window.__TAURI__.window;
-const { openPath } = window.__TAURI__.opener;
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
+import { getCurrentWindow, LogicalSize, LogicalPosition } from "@tauri-apps/api/window";
+import { openPath } from "@tauri-apps/plugin-opener";
 
 // state.js documents all mutable state in one place for future refactoring
 // import state from "./state.js";
@@ -22,6 +22,7 @@ import {
   formatFileSize,
   escapeHtml,
   getFileExt,
+  getFileTypeIcon,
   isImageFile,
   isContentExtractable,
   isToday,
@@ -29,7 +30,14 @@ import {
   validateModuleName,
   buildCorrectionHistory,
   filterNewFiles,
+  getCachedClassification,
+  matchRule,
+  pathJoin,
+  pathBasename,
 } from "./utils.js";
+import { getErrorMessage, isLockedFileError, isDuplicateError } from "./errors.js";
+import { showOnboardingScreen, initOnboarding } from "./onboarding.js";
+import { showSettingsScreen, initSettings } from "./settings.js";
 import {
   addCorrection as dbAddCorrection,
   getCorrections as dbGetCorrections,
@@ -38,6 +46,7 @@ import {
   markActivityUndone as dbMarkActivityUndone,
   clearActivityLog as dbClearActivityLog,
   migrateFromLocalStorage,
+  getRules as dbGetRules,
 } from "./storage.js";
 
 // ============================================================
@@ -62,7 +71,7 @@ let autoMoveThreshold = 0.9;
 let notificationsEnabled = false;
 let notificationApi = null;
 let darkModeEnabled = false;
-let userApiKey = "";
+let classificationRules = [];
 
 function applyTheme() {
   document.documentElement.setAttribute("data-theme", darkModeEnabled ? "dark" : "light");
@@ -79,7 +88,6 @@ async function restoreWindowState() {
     const state = JSON.parse(saved);
     if (!state.width || !state.height) return;
     const appWindow = getCurrentWindow();
-    const { LogicalSize, LogicalPosition } = window.__TAURI__.window;
     await appWindow.setSize(new LogicalSize(state.width, state.height));
     if (state.x !== undefined && state.y !== undefined) {
       await appWindow.setPosition(new LogicalPosition(state.x, state.y));
@@ -133,20 +141,22 @@ window.addEventListener("DOMContentLoaded", () => {
     loadSavedConfig();
     showAppScreen();
   } else {
-    showOnboardingScreen();
+    const onboardingState = { userModules, basePath };
+    showOnboardingScreen(() => initOnboarding(onboardingState, {
+      onComplete() {
+        userModules = onboardingState.userModules;
+        basePath = onboardingState.basePath;
+        showAppScreen();
+      }
+    }));
   }
 });
 
 async function loadSavedConfig() {
   try {
-    // Migrate localStorage data to SQLite (one-time operation)
-    await migrateFromLocalStorage();
-
-    // Load corrections and activity from SQLite database
-    correctionLog = await dbGetCorrections();
-    activityLog = await dbGetActivityLog();
-
-    // Load other settings from localStorage (simpler for settings)
+    // Load settings from localStorage FIRST (synchronous, available immediately).
+    // This ensures watchPath/userModules are set before checkWatcherState() runs,
+    // even though this function is not awaited by its callers.
     const savedModules = localStorage.getItem(STORAGE_KEYS.modules);
     const savedBasePath = localStorage.getItem(STORAGE_KEYS.basePath);
     const savedWatchPath = localStorage.getItem(STORAGE_KEYS.watchPath);
@@ -172,8 +182,24 @@ async function loadSavedConfig() {
       darkModeEnabled = window.matchMedia("(prefers-color-scheme: dark)").matches;
     }
     applyTheme();
-    const savedApiKey = localStorage.getItem(STORAGE_KEYS.apiKey);
-    if (savedApiKey) userApiKey = savedApiKey;
+
+    // Async DB operations (callers don't await, so these run in background)
+    await migrateFromLocalStorage();
+    correctionLog = await dbGetCorrections();
+    activityLog = await dbGetActivityLog();
+    try { classificationRules = await dbGetRules(); } catch (e) { classificationRules = []; }
+
+    // Migrate API key from localStorage to secure Rust-side storage (one-time)
+    const oldApiKey = localStorage.getItem(STORAGE_KEYS.apiKey);
+    if (oldApiKey) {
+      try {
+        await invoke("set_api_key", { key: oldApiKey });
+        localStorage.removeItem(STORAGE_KEYS.apiKey);
+        console.log("[MIGRATION] API key migrated from localStorage to secure storage");
+      } catch (e) {
+        console.error("Failed to migrate API key:", e);
+      }
+    }
   } catch (e) {
     console.error("Failed to load saved config:", e);
   }
@@ -235,9 +261,9 @@ async function logCorrection(filename, aiSuggested, userChose, type) {
 // buildCorrectionHistory is imported from utils.js
 
 // Save an activity log entry (async, uses SQLite)
-async function addActivityEntry(filename, fromFolder, toFolder) {
+async function addActivityEntry(filename, fromFolder, toFolder, originalFilename = null) {
   // Save to SQLite database
-  const entry = await dbAddActivity(filename, fromFolder, toFolder);
+  const entry = await dbAddActivity(filename, fromFolder, toFolder, originalFilename);
   // Update in-memory log
   activityLog = await dbGetActivityLog();
   return entry;
@@ -248,547 +274,6 @@ async function markActivityUndone(timestamp) {
   await dbMarkActivityUndone(timestamp);
   // Update in-memory log
   activityLog = await dbGetActivityLog();
-}
-
-// ============================================================
-// ONBOARDING SCREEN
-// ============================================================
-function showOnboardingScreen() {
-  document.getElementById("onboarding-screen").style.display = "block";
-  document.getElementById("app-screen").style.display = "none";
-  document.getElementById("settings-screen").style.display = "none";
-  initOnboarding();
-}
-
-function initOnboarding() {
-  const moduleList = document.getElementById("module-list");
-  const addModuleBtn = document.getElementById("add-module-btn");
-  const addModuleInput = document.getElementById("add-module-input");
-  const newModuleName = document.getElementById("new-module-name");
-  const confirmAddBtn = document.getElementById("confirm-add-btn");
-  const cancelAddBtn = document.getElementById("cancel-add-btn");
-  const scanFoldersBtn = document.getElementById("scan-folders-btn");
-  const browseBaseBtn = document.getElementById("browse-base-btn");
-  const basePathInput = document.getElementById("base-path-input");
-  const continueBtn = document.getElementById("continue-btn");
-  const onboardingStatus = document.getElementById("onboarding-status");
-
-  // Load any previously saved base path
-  const savedBasePath = localStorage.getItem(STORAGE_KEYS.basePath);
-  if (savedBasePath) {
-    basePath = savedBasePath;
-    basePathInput.value = savedBasePath;
-  }
-
-  // --- Browse for base education folder ---
-  browseBaseBtn.addEventListener("click", async () => {
-    try {
-      const selected = await open({
-        directory: true,
-        multiple: false,
-        title: "Select your education folder (e.g. Year 2)",
-      });
-      if (selected && selected !== basePath) {
-        basePath = selected;
-        basePathInput.value = selected;
-        // Clear modules - they belonged to the old folder
-        userModules = [];
-        renderModuleList();
-        localStorage.setItem(STORAGE_KEYS.basePath, selected);
-        localStorage.setItem(STORAGE_KEYS.modules, JSON.stringify(userModules));
-        showOnboardingStatus("Folder set - click 'Scan' to detect modules", "info");
-        updateContinueBtn();
-      }
-    } catch (error) {
-      showOnboardingStatus(`Error: ${error}`, "error");
-    }
-  });
-
-  // --- Scan existing folders ---
-  scanFoldersBtn.addEventListener("click", async () => {
-    if (!basePath) {
-      showOnboardingStatus("Please select your education folder first (Browse button below)", "error");
-      return;
-    }
-
-    scanFoldersBtn.disabled = true;
-    scanFoldersBtn.textContent = "Scanning...";
-
-    try {
-      const folders = await invoke("scan_folders", { path: basePath });
-
-      if (folders.length === 0) {
-        showOnboardingStatus("No subfolders found in that directory", "info");
-      } else {
-        // Replace current module list with scanned folders
-        userModules = folders;
-        renderModuleList();
-        showOnboardingStatus(`Found ${folders.length} course folders`, "success");
-      }
-    } catch (error) {
-      showOnboardingStatus(`Scan failed: ${error}`, "error");
-    }
-
-    scanFoldersBtn.disabled = false;
-    scanFoldersBtn.textContent = "Scan existing course folders";
-    updateContinueBtn();
-  });
-
-  // --- Add Module button ---
-  addModuleBtn.addEventListener("click", () => {
-    addModuleInput.style.display = "flex";
-    addModuleBtn.style.display = "none";
-    newModuleName.value = "";
-    newModuleName.focus();
-  });
-
-  // --- Confirm add module ---
-  const doAddModule = () => {
-    const name = newModuleName.value.trim();
-    if (name) {
-      const validationError = validateModuleName(name);
-      if (validationError) {
-        showOnboardingStatus(validationError, "error");
-        return;
-      }
-      // Check for duplicates
-      if (userModules.some(m => m.toLowerCase() === name.toLowerCase())) {
-        showOnboardingStatus("Module already exists", "error");
-        return;
-      }
-      userModules.push(name);
-      renderModuleList();
-      updateContinueBtn();
-    }
-    addModuleInput.style.display = "none";
-    addModuleBtn.style.display = "block";
-    newModuleName.value = "";
-  };
-
-  confirmAddBtn.addEventListener("click", doAddModule);
-  newModuleName.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") doAddModule();
-    if (e.key === "Escape") {
-      addModuleInput.style.display = "none";
-      addModuleBtn.style.display = "block";
-    }
-  });
-
-  // --- Cancel add ---
-  cancelAddBtn.addEventListener("click", () => {
-    addModuleInput.style.display = "none";
-    addModuleBtn.style.display = "block";
-  });
-
-  // --- Continue ---
-  continueBtn.addEventListener("click", async () => {
-    if (userModules.length === 0 || !basePath) return;
-
-    continueBtn.disabled = true;
-    continueBtn.textContent = "Setting up...";
-
-    // Create any missing folders
-    for (const moduleName of userModules) {
-      const folderPath = basePath + "\\" + moduleName;
-      try {
-        await invoke("create_folder", { path: folderPath });
-      } catch (error) {
-        console.error(`Failed to create folder for ${moduleName}:`, error);
-      }
-    }
-
-    // Save to localStorage
-    localStorage.setItem(STORAGE_KEYS.modules, JSON.stringify(userModules));
-    localStorage.setItem(STORAGE_KEYS.basePath, basePath);
-    localStorage.setItem(STORAGE_KEYS.onboarded, "true");
-
-    // Switch to main app
-    showAppScreen();
-  });
-
-  // Initial render
-  renderModuleList();
-  updateContinueBtn();
-
-  // --- Helper: render module list ---
-  function renderModuleList() {
-    moduleList.innerHTML = "";
-    userModules.forEach((name, index) => {
-      const item = document.createElement("div");
-      item.className = "module-item";
-      item.innerHTML = `
-        <span class="module-name">${escapeHtml(name)}</span>
-        <button class="module-remove-btn" title="Remove module" aria-label="Remove module">&times;</button>
-      `;
-      item.querySelector(".module-remove-btn").addEventListener("click", () => {
-        userModules.splice(index, 1);
-        renderModuleList();
-        updateContinueBtn();
-      });
-      moduleList.appendChild(item);
-    });
-  }
-
-  // --- Helper: update continue button state ---
-  function updateContinueBtn() {
-    continueBtn.disabled = userModules.length === 0 || !basePath;
-  }
-
-  // --- Helper: show status on onboarding screen ---
-  function showOnboardingStatus(message, type) {
-    onboardingStatus.textContent = message;
-    onboardingStatus.className = `status-msg ${type}`;
-    setTimeout(() => {
-      if (onboardingStatus.textContent === message) {
-        onboardingStatus.textContent = "";
-        onboardingStatus.className = "status-msg";
-      }
-    }, ONBOARDING_STATUS_TIMEOUT_MS);
-  }
-}
-
-// ============================================================
-// SETTINGS SCREEN
-// ============================================================
-function showSettingsScreen() {
-  document.getElementById("app-screen").style.display = "none";
-  document.getElementById("onboarding-screen").style.display = "none";
-  document.getElementById("settings-screen").style.display = "block";
-  initSettings();
-}
-
-function initSettings() {
-  const backBtn = document.getElementById("settings-back-btn");
-  const basePathInput = document.getElementById("settings-base-path");
-  const browseBaseBtn = document.getElementById("settings-browse-base-btn");
-  const moduleList = document.getElementById("settings-module-list");
-  const addModuleBtn = document.getElementById("settings-add-module-btn");
-  const addModuleInput = document.getElementById("settings-add-module-input");
-  const newModuleName = document.getElementById("settings-new-module-name");
-  const confirmAddBtn = document.getElementById("settings-confirm-add-btn");
-  const cancelAddBtn = document.getElementById("settings-cancel-add-btn");
-  const scanFoldersBtn = document.getElementById("settings-scan-folders-btn");
-  const watchPathInput = document.getElementById("settings-watch-path");
-  const browseWatchBtn = document.getElementById("settings-browse-watch-btn");
-  const autoMoveToggle = document.getElementById("settings-auto-move-toggle");
-  const thresholdSlider = document.getElementById("settings-threshold-slider");
-  const thresholdValue = document.getElementById("threshold-value");
-  const thresholdGroup = document.getElementById("threshold-slider-group");
-  const notificationsToggle = document.getElementById("settings-notifications-toggle");
-  const notificationHint = document.getElementById("notification-permission-hint");
-  const darkModeToggle = document.getElementById("settings-dark-mode-toggle");
-  const apiKeyInput = document.getElementById("settings-api-key");
-  const toggleKeyBtn = document.getElementById("settings-toggle-key-btn");
-  const apiKeyStatus = document.getElementById("api-key-status");
-  const saveBtn = document.getElementById("settings-save-btn");
-  const settingsStatus = document.getElementById("settings-status");
-
-  // Auto-save helper - persists settings immediately
-  function autoSaveSettings() {
-    localStorage.setItem(STORAGE_KEYS.modules, JSON.stringify(userModules));
-    localStorage.setItem(STORAGE_KEYS.basePath, basePath);
-    localStorage.setItem(STORAGE_KEYS.watchPath, watchPath);
-    localStorage.setItem(STORAGE_KEYS.autoMoveEnabled, String(autoMoveEnabled));
-    localStorage.setItem(STORAGE_KEYS.autoMoveThreshold, String(autoMoveThreshold));
-    localStorage.setItem(STORAGE_KEYS.notificationsEnabled, String(notificationsEnabled));
-    localStorage.setItem(STORAGE_KEYS.theme, darkModeEnabled ? "dark" : "light");
-    localStorage.setItem(STORAGE_KEYS.apiKey, userApiKey);
-  }
-
-  // Populate current values (working directly with global state)
-  basePathInput.value = basePath;
-  watchPathInput.value = watchPath || "";
-  notificationsToggle.checked = notificationsEnabled;
-  notificationHint.style.display = "none";
-  autoMoveToggle.checked = autoMoveEnabled;
-  thresholdSlider.value = Math.round(autoMoveThreshold * 100);
-  thresholdValue.textContent = Math.round(autoMoveThreshold * 100) + "%";
-  thresholdGroup.style.display = autoMoveEnabled ? "block" : "none";
-  darkModeToggle.checked = darkModeEnabled;
-  apiKeyInput.value = userApiKey;
-  apiKeyStatus.textContent = userApiKey ? "Key saved" : "";
-  apiKeyStatus.style.color = userApiKey ? "var(--success)" : "";
-
-  // API key show/hide toggle
-  toggleKeyBtn.addEventListener("click", () => {
-    const isPassword = apiKeyInput.type === "password";
-    apiKeyInput.type = isPassword ? "text" : "password";
-    toggleKeyBtn.textContent = isPassword ? "Hide" : "Show";
-  });
-
-  // Save API key on blur (when user clicks away from the field)
-  apiKeyInput.addEventListener("change", () => {
-    const val = apiKeyInput.value.trim();
-    userApiKey = val;
-    autoSaveSettings();
-    if (val) {
-      apiKeyStatus.textContent = "Key saved";
-      apiKeyStatus.style.color = "var(--success)";
-    } else {
-      apiKeyStatus.textContent = "No key set - AI classification will not work";
-      apiKeyStatus.style.color = "var(--warning)";
-    }
-  });
-
-  renderSettingsModuleList();
-
-  // Dark mode toggle - clone switch to remove old handlers
-  const oldDarkModeSwitch = darkModeToggle.nextElementSibling;
-  const darkModeSwitch = oldDarkModeSwitch.cloneNode(true);
-  oldDarkModeSwitch.parentNode.replaceChild(darkModeSwitch, oldDarkModeSwitch);
-  darkModeSwitch.addEventListener("click", function(e) {
-    e.preventDefault();
-    e.stopPropagation();
-    darkModeToggle.checked = !darkModeToggle.checked;
-    darkModeEnabled = darkModeToggle.checked;
-    applyTheme();
-    autoSaveSettings();
-  });
-
-  // Helper to close settings and return to main app
-  function closeSettings() {
-    document.getElementById("settings-screen").style.display = "none";
-    document.getElementById("app-screen").style.display = "block";
-    updateConfigSummary();
-  }
-
-  // Back button - just close (changes are auto-saved)
-  const newBackBtn = backBtn.cloneNode(true);
-  backBtn.parentNode.replaceChild(newBackBtn, backBtn);
-  newBackBtn.addEventListener("click", closeSettings);
-
-  // Done button - create folders and close (settings already auto-saved)
-  const newSaveBtn = saveBtn.cloneNode(true);
-  newSaveBtn.textContent = "Done";
-  saveBtn.parentNode.replaceChild(newSaveBtn, saveBtn);
-  newSaveBtn.addEventListener("click", async () => {
-    if (userModules.length === 0) {
-      showSettingsStatus("Please add at least one module", "error");
-      return;
-    }
-    if (!basePath) {
-      showSettingsStatus("Please select an education folder", "error");
-      return;
-    }
-
-    newSaveBtn.disabled = true;
-    newSaveBtn.textContent = "Creating folders...";
-
-    // Create any missing module folders
-    for (const moduleName of userModules) {
-      const folderPath = basePath + "\\" + moduleName;
-      try {
-        await invoke("create_folder", { path: folderPath });
-      } catch (error) {
-        console.error(`Failed to create folder for ${moduleName}:`, error);
-      }
-    }
-
-    newSaveBtn.disabled = false;
-    newSaveBtn.textContent = "Done";
-    closeSettings();
-  });
-
-  // Browse education folder
-  const newBrowseBase = browseBaseBtn.cloneNode(true);
-  browseBaseBtn.parentNode.replaceChild(newBrowseBase, browseBaseBtn);
-  newBrowseBase.addEventListener("click", async () => {
-    try {
-      const selected = await open({ directory: true, multiple: false, title: "Select your education folder" });
-      if (selected && selected !== basePath) {
-        basePath = selected;
-        basePathInput.value = selected;
-        // Clear modules - they belonged to the old folder
-        userModules = [];
-        renderSettingsModuleList();
-        autoSaveSettings();
-        showSettingsStatus("Folder changed - click 'Scan' to detect modules", "info");
-      }
-    } catch (error) {
-      showSettingsStatus(`Error: ${error}`, "error");
-    }
-  });
-
-  // Browse watch folder
-  const newBrowseWatch = browseWatchBtn.cloneNode(true);
-  browseWatchBtn.parentNode.replaceChild(newBrowseWatch, browseWatchBtn);
-  newBrowseWatch.addEventListener("click", async () => {
-    try {
-      const selected = await open({ directory: true, multiple: false, title: "Select folder to watch" });
-      if (selected) {
-        watchPath = selected;
-        watchPathInput.value = selected;
-        autoSaveSettings();
-        showSettingsStatus("Watch folder saved", "success");
-      }
-    } catch (error) {
-      showSettingsStatus(`Error: ${error}`, "error");
-    }
-  });
-
-  // Scan existing folders
-  const newScanBtn = scanFoldersBtn.cloneNode(true);
-  scanFoldersBtn.parentNode.replaceChild(newScanBtn, scanFoldersBtn);
-  newScanBtn.addEventListener("click", async () => {
-    if (!basePath) {
-      showSettingsStatus("Please select your education folder first", "error");
-      return;
-    }
-    newScanBtn.disabled = true;
-    newScanBtn.textContent = "Scanning...";
-    try {
-      const folders = await invoke("scan_folders", { path: basePath });
-      if (folders.length === 0) {
-        showSettingsStatus("No subfolders found", "info");
-      } else {
-        userModules = folders;
-        renderSettingsModuleList();
-        autoSaveSettings();
-        showSettingsStatus(`Found ${folders.length} course folders - saved!`, "success");
-      }
-    } catch (error) {
-      showSettingsStatus(`Scan failed: ${error}`, "error");
-    }
-    newScanBtn.disabled = false;
-    newScanBtn.textContent = "Scan existing course folders";
-  });
-
-  // Add module
-  const newAddBtn = addModuleBtn.cloneNode(true);
-  addModuleBtn.parentNode.replaceChild(newAddBtn, addModuleBtn);
-  newAddBtn.addEventListener("click", () => {
-    addModuleInput.style.display = "flex";
-    newAddBtn.style.display = "none";
-    newModuleName.value = "";
-    newModuleName.focus();
-  });
-
-  const doAdd = () => {
-    const name = newModuleName.value.trim();
-    if (name) {
-      const validationError = validateModuleName(name);
-      if (validationError) {
-        showSettingsStatus(validationError, "error");
-        return;
-      }
-      if (userModules.some(m => m.toLowerCase() === name.toLowerCase())) {
-        showSettingsStatus("Module already exists", "error");
-        return;
-      }
-      userModules.push(name);
-      renderSettingsModuleList();
-      autoSaveSettings();
-    }
-    addModuleInput.style.display = "none";
-    newAddBtn.style.display = "block";
-    newModuleName.value = "";
-  };
-
-  const newConfirmBtn = confirmAddBtn.cloneNode(true);
-  confirmAddBtn.parentNode.replaceChild(newConfirmBtn, confirmAddBtn);
-  newConfirmBtn.addEventListener("click", doAdd);
-
-  const newCancelBtn = cancelAddBtn.cloneNode(true);
-  cancelAddBtn.parentNode.replaceChild(newCancelBtn, cancelAddBtn);
-  newCancelBtn.addEventListener("click", () => {
-    addModuleInput.style.display = "none";
-    newAddBtn.style.display = "block";
-  });
-
-  // Handle enter/escape in module input
-  newModuleName.onkeydown = (e) => {
-    if (e.key === "Enter") doAdd();
-    if (e.key === "Escape") {
-      addModuleInput.style.display = "none";
-      newAddBtn.style.display = "block";
-    }
-  };
-
-  // Notification toggle - clone switch to remove old handlers
-  notificationsToggle.checked = notificationsEnabled;
-  const oldNotifSwitch = notificationsToggle.nextElementSibling;
-  const notifSwitch = oldNotifSwitch.cloneNode(true);
-  oldNotifSwitch.parentNode.replaceChild(notifSwitch, oldNotifSwitch);
-  notifSwitch.addEventListener("click", async function(e) {
-    e.preventDefault();
-    e.stopPropagation();
-
-    const newState = !notificationsToggle.checked;
-    notificationsToggle.checked = newState;
-    notificationsEnabled = newState;
-
-    if (newState && notificationApi) {
-      try {
-        const granted = await notificationApi.isPermissionGranted();
-        if (!granted) {
-          const permission = await notificationApi.requestPermission();
-          if (permission !== "granted") {
-            notificationsToggle.checked = false;
-            notificationsEnabled = false;
-            notificationHint.style.display = "block";
-          }
-        }
-      } catch (err) {
-        console.error("Notification permission error:", err);
-      }
-    }
-
-    if (!newState) {
-      notificationHint.style.display = "none";
-    }
-    autoSaveSettings();
-  });
-
-  // Auto-move toggle - clone switch to remove old handlers
-  autoMoveToggle.checked = autoMoveEnabled;
-  const oldAutoMoveSwitch = autoMoveToggle.nextElementSibling;
-  const autoMoveSwitch = oldAutoMoveSwitch.cloneNode(true);
-  oldAutoMoveSwitch.parentNode.replaceChild(autoMoveSwitch, oldAutoMoveSwitch);
-  autoMoveSwitch.addEventListener("click", function(e) {
-    e.preventDefault();
-    e.stopPropagation();
-    autoMoveToggle.checked = !autoMoveToggle.checked;
-    autoMoveEnabled = autoMoveToggle.checked;
-    thresholdGroup.style.display = autoMoveEnabled ? "block" : "none";
-    autoSaveSettings();
-  });
-
-  // Threshold slider - use oninput to replace any existing handler
-  thresholdSlider.value = Math.round(autoMoveThreshold * 100);
-  thresholdSlider.oninput = function() {
-    autoMoveThreshold = parseInt(this.value) / 100;
-    thresholdValue.textContent = this.value + "%";
-    autoSaveSettings();
-  };
-
-  function renderSettingsModuleList() {
-    moduleList.innerHTML = "";
-    userModules.forEach((name, index) => {
-      const item = document.createElement("div");
-      item.className = "module-item";
-      item.innerHTML = `
-        <span class="module-name">${escapeHtml(name)}</span>
-        <button class="module-remove-btn" title="Remove module" aria-label="Remove module">&times;</button>
-      `;
-      item.querySelector(".module-remove-btn").addEventListener("click", () => {
-        userModules.splice(index, 1);
-        renderSettingsModuleList();
-        autoSaveSettings();
-      });
-      moduleList.appendChild(item);
-    });
-  }
-
-  function showSettingsStatus(message, type) {
-    settingsStatus.textContent = message;
-    settingsStatus.className = `status-msg ${type}`;
-    setTimeout(() => {
-      if (settingsStatus.textContent === message) {
-        settingsStatus.textContent = "";
-        settingsStatus.className = "status-msg";
-      }
-    }, ONBOARDING_STATUS_TIMEOUT_MS);
-  }
 }
 
 // ============================================================
@@ -806,7 +291,7 @@ function showAppScreen() {
 function updateConfigSummary() {
   const summary = document.querySelector("#config-summary");
   if (!summary) return;
-  const watchDisplay = watchPath ? watchPath.split("\\").pop() : "Not set";
+  const watchDisplay = watchPath ? pathBasename(watchPath) : "Not set";
   const moduleCount = userModules.length;
   const autoMoveDisplay = autoMoveEnabled ? `Auto-move: ${Math.round(autoMoveThreshold * 100)}%+` : "Auto-move: off";
   summary.innerHTML = `<strong>Watching:</strong> ${escapeHtml(watchDisplay)} &nbsp;|&nbsp; <strong>${moduleCount}</strong> modules &nbsp;|&nbsp; ${autoMoveDisplay}`;
@@ -828,6 +313,7 @@ function initApp() {
   const batchActions = document.querySelector("#batch-actions");
   const acceptAllHighBtn = document.querySelector("#accept-all-high-btn");
   const highConfidenceCount = document.querySelector("#high-confidence-count");
+  const dismissAllBtn = document.querySelector("#dismiss-all-btn");
   const skippedSection = document.querySelector("#skipped-section");
   const skippedCountEl = document.querySelector("#skipped-count");
   const reviewSkippedBtn = document.querySelector("#review-skipped-btn");
@@ -885,12 +371,30 @@ function initApp() {
 
   // Settings button -> settings screen
   settingsBtn.addEventListener("click", () => {
-    showSettingsScreen();
+    const settingsState = {
+      basePath, watchPath, userModules, autoMoveEnabled, autoMoveThreshold,
+      notificationsEnabled, darkModeEnabled, classificationRules, notificationApi,
+    };
+    showSettingsScreen(() => initSettings(settingsState, {
+      onClose() {
+        basePath = settingsState.basePath;
+        watchPath = settingsState.watchPath;
+        userModules = settingsState.userModules;
+        autoMoveEnabled = settingsState.autoMoveEnabled;
+        autoMoveThreshold = settingsState.autoMoveThreshold;
+        notificationsEnabled = settingsState.notificationsEnabled;
+        darkModeEnabled = settingsState.darkModeEnabled;
+        classificationRules = settingsState.classificationRules;
+        updateConfigSummary();
+      },
+      applyTheme() { applyTheme(); },
+    }));
   });
 
   // Set up event listeners
   startWatchingBtn.addEventListener("click", toggleWatching);
   acceptAllHighBtn.addEventListener("click", acceptAllHighConfidence);
+  dismissAllBtn.addEventListener("click", dismissAll);
   scanFolderBtn.addEventListener("click", startBulkScan);
   scanCancelBtn.addEventListener("click", () => { scanCancelled = true; });
 
@@ -923,64 +427,100 @@ function initApp() {
 
   // --- Build available folders from user modules ---
   function getAvailableFolders() {
-    return userModules.map(name => basePath + "\\" + name);
+    return userModules.map(name => pathJoin(basePath, name));
   }
 
   // --- Build folder select options ---
   function buildFolderOptions() {
     let options = '<option value="">Choose destination...</option>';
     for (const name of userModules) {
-      const fullPath = basePath + "\\" + name;
+      const fullPath = pathJoin(basePath, name);
       options += `<option value="${escapeHtml(fullPath)}">${escapeHtml(name)}</option>`;
     }
     return options;
   }
 
-  // Quick-create a module from an unsorted file card
-  async function quickCreateModule(fileInfo, fileItem, classification) {
-    const name = prompt("Enter new module name:");
-    if (!name || !name.trim()) return;
-
-    const trimmed = name.trim();
-    const validationError = validateModuleName(trimmed);
-    if (validationError) {
-      showStatus(validationError, "error");
-      return;
-    }
-    if (userModules.some(m => m.toLowerCase() === trimmed.toLowerCase())) {
-      showStatus("Module already exists", "error");
-      return;
-    }
-
-    // Add module
-    userModules.push(trimmed);
-    localStorage.setItem(STORAGE_KEYS.modules, JSON.stringify(userModules));
-
-    // Create the folder
-    const fullPath = basePath + "\\" + trimmed;
-    try {
-      await invoke("create_folder", { path: fullPath });
-    } catch (e) {
-      console.error(`Failed to create folder for ${trimmed}:`, e);
-    }
-
-    // Update all folder dropdowns on existing cards
-    const newOptions = buildFolderOptions();
-    document.querySelectorAll(".folder-select").forEach(sel => {
-      const currentVal = sel.value;
-      sel.innerHTML = newOptions;
-      sel.value = currentVal;
-    });
-
-    // Auto-select and move to the new module
-    const folderSelect = fileItem.querySelector(".folder-select");
-    if (folderSelect) {
-      folderSelect.value = fullPath;
-    }
-
-    // Update suggestion display
+  // Quick-create a module from an unsorted file card (inline input, no prompt())
+  function quickCreateModule(fileInfo, fileItem, classification) {
     const suggestionDiv = fileItem.querySelector(".ai-suggestion");
-    if (suggestionDiv) {
+    if (!suggestionDiv) return;
+
+    // If inline input already open, just focus it
+    const existingInput = suggestionDiv.querySelector(".inline-module-input");
+    if (existingInput) {
+      existingInput.querySelector("input").focus();
+      return;
+    }
+
+    // Hide the "+ Create Module" button and show inline input
+    const createBtn = suggestionDiv.querySelector(".create-module-btn");
+    if (createBtn) createBtn.style.display = "none";
+
+    const inputDiv = document.createElement("div");
+    inputDiv.className = "inline-module-input";
+    inputDiv.innerHTML = `
+      <input type="text" class="module-name-input" placeholder="e.g. Machine Learning" />
+      <button class="confirm-create-btn">Create</button>
+      <button class="cancel-create-btn">Cancel</button>
+    `;
+
+    const aiResult = suggestionDiv.querySelector(".ai-result");
+    if (aiResult) {
+      aiResult.appendChild(inputDiv);
+    } else {
+      suggestionDiv.appendChild(inputDiv);
+    }
+
+    const input = inputDiv.querySelector(".module-name-input");
+    input.focus();
+
+    const cancelInline = () => {
+      inputDiv.remove();
+      if (createBtn) createBtn.style.display = "";
+    };
+
+    const doCreate = async () => {
+      const name = input.value;
+      if (!name || !name.trim()) return;
+
+      const trimmed = name.trim();
+      const validationError = validateModuleName(trimmed);
+      if (validationError) {
+        showStatus(validationError, "error");
+        return;
+      }
+      if (userModules.some(m => m.toLowerCase() === trimmed.toLowerCase())) {
+        showStatus("Module already exists", "error");
+        return;
+      }
+
+      // Add module
+      userModules.push(trimmed);
+      localStorage.setItem(STORAGE_KEYS.modules, JSON.stringify(userModules));
+
+      // Create the folder
+      const fullPath = pathJoin(basePath, trimmed);
+      try {
+        await invoke("create_folder", { path: fullPath });
+      } catch (e) {
+        console.error(`Failed to create folder for ${trimmed}:`, e);
+      }
+
+      // Update all folder dropdowns on existing cards
+      const newOptions = buildFolderOptions();
+      document.querySelectorAll(".folder-select").forEach(sel => {
+        const currentVal = sel.value;
+        sel.innerHTML = newOptions;
+        sel.value = currentVal;
+      });
+
+      // Auto-select the new module in this card's dropdown
+      const folderSelect = fileItem.querySelector(".folder-select");
+      if (folderSelect) {
+        folderSelect.value = fullPath;
+      }
+
+      // Update suggestion display
       suggestionDiv.innerHTML = `
         <div class="ai-result high">
           <strong>New module:</strong> ${escapeHtml(trimmed)}
@@ -991,11 +531,20 @@ function initApp() {
       suggestionDiv.querySelector(".accept-btn").addEventListener("click", function() {
         acceptAISuggestion(fileInfo.path, fullPath, this);
       });
-    }
 
-    updateConfigSummary();
-    scanFolderBtn.disabled = false;
-    showStatus(`Module "${trimmed}" created`, "success");
+      updateConfigSummary();
+      scanFolderBtn.disabled = false;
+      showStatus(`Module "${trimmed}" created`, "success");
+    };
+
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); doCreate(); }
+      if (e.key === "Escape") cancelInline();
+      e.stopPropagation(); // Prevent global keyboard shortcuts while typing
+    });
+    input.addEventListener("keyup", (e) => e.stopPropagation());
+    inputDiv.querySelector(".confirm-create-btn").addEventListener("click", doCreate);
+    inputDiv.querySelector(".cancel-create-btn").addEventListener("click", cancelInline);
   }
 
   // Check watcher state on init (handles returning from Settings)
@@ -1245,8 +794,7 @@ function initApp() {
 
       for (const filePath of paths) {
         // Extract filename and get file size via scan_files on parent dir
-        const parts = filePath.replace(/\//g, "\\").split("\\");
-        const name = parts.pop();
+        const name = pathBasename(filePath);
         const fileInfo = { name, path: filePath, size: 0, timestamp: Date.now() };
 
         // Skip if already tracked
@@ -1281,16 +829,52 @@ function initApp() {
       const tag = e.target.tagName.toLowerCase();
       if (tag === "input" || tag === "textarea" || tag === "select") return;
 
+      // Ctrl+Z: Undo last move (works even without a file card)
+      if (e.ctrlKey && e.key === "z") {
+        e.preventDefault();
+        handleUndo();
+        return;
+      }
+
       // Get the first (top) file card in the list
       const topCard = fileList.querySelector(".file-item");
       if (!topCard) return;
 
+      // Number keys 1-9: Move to folder by index
+      if (e.key >= "1" && e.key <= "9") {
+        const folderSelect = topCard.querySelector(".folder-select");
+        const index = parseInt(e.key); // 1-based (0 is "Choose destination...")
+        if (folderSelect && index < folderSelect.options.length) {
+          folderSelect.selectedIndex = index;
+          const moveBtn = topCard.querySelector(".move-btn");
+          if (moveBtn && !moveBtn.disabled) moveBtn.click();
+        }
+        return;
+      }
+
       switch (e.key.toLowerCase()) {
+        case "enter": {
+          // Accept AI suggestion
+          e.preventDefault();
+          const acceptBtn = topCard.querySelector(".accept-btn");
+          if (acceptBtn && !acceptBtn.disabled) {
+            acceptBtn.click();
+          }
+          break;
+        }
         case "a": {
           // Accept AI suggestion
           const acceptBtn = topCard.querySelector(".accept-btn");
           if (acceptBtn && !acceptBtn.disabled) {
             acceptBtn.click();
+          }
+          break;
+        }
+        case "escape": {
+          // Dismiss / ignore
+          const ignoreBtn = topCard.querySelector(".ignore-btn");
+          if (ignoreBtn) {
+            ignoreBtn.click();
           }
           break;
         }
@@ -1381,17 +965,28 @@ function initApp() {
 
   // File type helpers and CONFIDENCE_THRESHOLD imported from utils.js / constants.js
 
-  // Two-pass classification:
-  // Pass 1: Classify by filename (fast, cheap)
-  // Pass 2: If confidence < threshold, use content analysis (vision for images, text extraction for PDFs)
+  // Classification pipeline: Rules → Cache → API (two-pass)
   async function invokeClassify(fileInfo, statusCallback) {
+    // Check user-defined rules first (instant, no API call)
+    const ruleResult = matchRule(fileInfo.name, classificationRules);
+    if (ruleResult) {
+      console.log(`[RULES] ${fileInfo.name} matched rule → ${ruleResult.suggested_folder}`);
+      return ruleResult;
+    }
+
+    // Check cache: reuse result if we've seen this exact filename before
+    const cached = getCachedClassification(fileInfo.name, correctionLog, userModules, basePath);
+    if (cached) {
+      console.log(`[CACHE] ${fileInfo.name} → ${cached.suggested_folder}`);
+      return cached;
+    }
+
     const availableFolders = getAvailableFolders();
     const correctionHistory = buildCorrectionHistory(correctionLog);
 
     // Pass 1: Filename-based classification
     if (statusCallback) statusCallback("Analyzing filename...");
     const firstPass = await invoke("classify_file", {
-      apiKey: userApiKey,
       filename: fileInfo.name,
       availableFolders: availableFolders,
       correctionHistory: correctionHistory,
@@ -1421,7 +1016,6 @@ function initApp() {
       if (statusCallback) statusCallback("Filename unclear - extracting text from image (OCR)...");
       try {
         return await invoke("classify_image_with_ocr", {
-          apiKey: userApiKey,
           filePath: fileInfo.path,
           filename: fileInfo.name,
           availableFolders: availableFolders,
@@ -1438,7 +1032,6 @@ function initApp() {
         if (statusCallback) statusCallback("OCR insufficient - analyzing with AI vision...");
         try {
           return await invoke("classify_image_file", {
-            apiKey: userApiKey,
             filePath: fileInfo.path,
             filename: fileInfo.name,
             availableFolders: availableFolders,
@@ -1456,7 +1049,6 @@ function initApp() {
       if (statusCallback) statusCallback("Filename unclear - reading file content for better classification...");
       try {
         return await invoke("classify_with_content", {
-          apiKey: userApiKey,
           filePath: fileInfo.path,
           filename: fileInfo.name,
           availableFolders: availableFolders,
@@ -1480,6 +1072,31 @@ function initApp() {
       const classification = await invokeClassify(fileInfo, (msg) => {
         if (loadingDiv) loadingDiv.textContent = msg;
       });
+
+      // Normalize suggested_folder: GPT sometimes returns just the folder name
+      // (e.g. "Machine Learning") instead of the full path. Match it against
+      // available folders to get the correct absolute path.
+      if (classification.suggested_folder &&
+          classification.suggested_folder !== "__UNSORTED__" &&
+          classification.is_relevant) {
+        const availableFolders = getAvailableFolders();
+        const sf = classification.suggested_folder;
+        // Already a full path that matches an available folder — keep as-is
+        if (!availableFolders.includes(sf)) {
+          // Try to match by folder name (last path segment)
+          const sfName = pathBasename(sf);
+          const match = availableFolders.find(f => {
+            const fName = pathBasename(f);
+            return fName.toLowerCase() === sfName.toLowerCase();
+          });
+          if (match) {
+            console.log(`[NORMALIZE] "${sf}" → "${match}"`);
+            classification.suggested_folder = match;
+          } else {
+            console.warn(`[NORMALIZE] Could not match "${sf}" to any available folder`);
+          }
+        }
+      }
 
       // Two-stage: check if file is educational
       if (!classification.is_relevant) {
@@ -1507,7 +1124,7 @@ function initApp() {
           classification.confidence >= autoMoveThreshold &&
           classification.suggested_folder &&
           classification.suggested_folder !== "__UNSORTED__") {
-        const suggestedModuleName = classification.suggested_folder.split("\\").pop();
+        const suggestedModuleName = pathBasename(classification.suggested_folder);
         console.log(`[AUTO-MOVE] ${fileInfo.name} → ${suggestedModuleName} (${Math.round(classification.confidence * 100)}%)`);
 
         try {
@@ -1517,7 +1134,7 @@ function initApp() {
           const moduleName = suggestedModuleName;
           logCorrection(filename, moduleName, moduleName, "accepted");
 
-          const movedDestPath = classification.suggested_folder + "\\" + filename;
+          const movedDestPath = pathJoin(classification.suggested_folder, filename);
           addActivityEntry(filename, watchPath, classification.suggested_folder);
           renderActivityLog();
           showUndoToast(filename, movedDestPath, watchPath);
@@ -1557,7 +1174,10 @@ function initApp() {
         const folderSelect = fileItem.querySelector(".folder-select");
         folderSelect.value = "";
       } else {
-        const suggestedModuleName = classification.suggested_folder.split("\\").pop();
+        const suggestedModuleName = pathBasename(classification.suggested_folder);
+
+        const hasSuggestedRename = classification.suggested_filename &&
+          classification.suggested_filename !== fileInfo.name;
 
         suggestionDiv.innerHTML = `
           <div class="ai-result ${confidenceClass}">
@@ -1565,6 +1185,14 @@ function initApp() {
             <span class="confidence">${confidencePercent}% confident</span>
             <button class="accept-btn">Accept</button>
           </div>
+          ${hasSuggestedRename ? `
+          <div class="ai-rename-suggestion">
+            <span>Rename:</span>
+            <input type="text" class="rename-input" value="${escapeHtml(classification.suggested_filename)}" readonly />
+            <button class="edit-rename-btn" title="Edit filename">&#9998;</button>
+            <button class="accept-rename-btn">Accept &amp; Rename</button>
+          </div>
+          ` : ""}
           <div class="ai-reasoning">${escapeHtml(classification.reasoning)}</div>
         `;
 
@@ -1572,9 +1200,48 @@ function initApp() {
           acceptAISuggestion(fileInfo.path, classification.suggested_folder, this);
         });
 
+        if (hasSuggestedRename) {
+          const renameInput = suggestionDiv.querySelector(".rename-input");
+          const editBtn = suggestionDiv.querySelector(".edit-rename-btn");
+          const acceptRenameBtn = suggestionDiv.querySelector(".accept-rename-btn");
+
+          editBtn.addEventListener("click", () => {
+            renameInput.removeAttribute("readonly");
+            renameInput.focus();
+            // Select text before extension
+            const dotIndex = renameInput.value.lastIndexOf(".");
+            renameInput.setSelectionRange(0, dotIndex > 0 ? dotIndex : renameInput.value.length);
+          });
+
+          acceptRenameBtn.addEventListener("click", function() {
+            acceptAISuggestionWithRename(
+              fileInfo.path, classification.suggested_folder,
+              renameInput.value.trim(), this
+            );
+          });
+        }
+
         const folderSelect = fileItem.querySelector(".folder-select");
         folderSelect.value = classification.suggested_folder;
       }
+
+      // Add folder quick-action chips below the suggestion
+      const chipsDiv = document.createElement("div");
+      chipsDiv.className = "folder-chips";
+      chipsDiv.innerHTML = userModules.map((name, i) => {
+        const fullPath = pathJoin(basePath, name);
+        const isSelected = fullPath === classification.suggested_folder;
+        return `<button class="folder-chip ${isSelected ? "selected" : ""}"
+                  data-folder="${escapeHtml(fullPath)}" title="Press ${i + 1} to move here">
+                  ${escapeHtml(name)}
+                </button>`;
+      }).join("");
+      suggestionDiv.appendChild(chipsDiv);
+      chipsDiv.querySelectorAll(".folder-chip").forEach(chip => {
+        chip.addEventListener("click", function() {
+          acceptAISuggestion(fileInfo.path, this.getAttribute("data-folder"), this);
+        });
+      });
 
       const fileIndex = detectedFiles.findIndex(f => f.path === fileInfo.path);
       if (fileIndex > -1) {
@@ -1654,7 +1321,7 @@ function initApp() {
       const suggestionDiv = fileItem.querySelector(".ai-suggestion");
       const confidencePercent = Math.round(classification.confidence * 100);
       const confidenceClass = classification.confidence > 0.8 ? "high" : classification.confidence > 0.5 ? "medium" : "low";
-      const suggestedModuleName = classification.suggested_folder.split("\\").pop() || "Unknown";
+      const suggestedModuleName = pathBasename(classification.suggested_folder) || "Unknown";
 
       if (classification.suggested_folder) {
         suggestionDiv.innerHTML = `
@@ -1691,6 +1358,7 @@ function initApp() {
     fileItem.innerHTML = `
       <div class="file-header">
         <div class="file-info">
+          <span class="file-type-icon">${getFileTypeIcon(fileInfo.name)}</span>
           <strong class="file-name-display">${escapeHtml(fileInfo.name)}</strong>
           <button class="rename-btn" title="Rename file" aria-label="Rename file">&#9998;</button>
           <small>${formatFileSize(fileInfo.size)}</small>
@@ -1875,11 +1543,12 @@ function initApp() {
   function dismissFile(fileInfo, fileItem) {
     // Log as dismissed so AI learns this type of file isn't worth suggesting
     const fileData = detectedFiles.find(f => f.path === fileInfo.path);
-    const aiSuggested = fileData?.classification?.suggested_folder?.split("\\").pop() || "unknown";
+    const aiSuggested = pathBasename(fileData?.classification?.suggested_folder || "") || "unknown";
     logCorrection(fileInfo.name, aiSuggested, "dismissed", "dismissed");
 
     removeFileFromUI(fileInfo.path, fileItem);
     addToIgnoredList(fileInfo);
+    renderStats();
     showStatus(`Ignored: ${fileInfo.name}`, "info");
   }
 
@@ -1929,17 +1598,17 @@ function initApp() {
 
     // Get the file info for correction logging
     const fileData = detectedFiles.find(f => f.path === filePath);
-    const filename = fileData?.name || filePath.split("\\").pop();
+    const filename = fileData?.name || pathBasename(filePath);
     const aiSuggested = fileData?.classification?.suggested_folder || "";
-    const destModuleName = destFolder.split("\\").pop();
-    const aiModuleName = aiSuggested.split("\\").pop();
+    const destModuleName = pathBasename(destFolder);
+    const aiModuleName = pathBasename(aiSuggested);
 
     try {
       const moveResult = await moveWithDuplicateCheck(filePath, destFolder, fileData);
       if (!moveResult.success) {
         buttonElement.disabled = false;
         buttonElement.textContent = "Move";
-        if (moveResult.cancelled) showStatus("Move cancelled", "info");
+        if (moveResult.skipped) showStatus("Move skipped", "info");
         return;
       }
 
@@ -1951,7 +1620,7 @@ function initApp() {
       }
 
       // Build the full destination path for undo
-      const movedDestPath = destFolder + "\\" + filename;
+      const movedDestPath = pathJoin(destFolder, filename);
       addActivityEntry(filename, watchPath, destFolder);
       renderActivityLog();
       showUndoToast(filename, movedDestPath, watchPath);
@@ -1961,23 +1630,23 @@ function initApp() {
       const statusText = moveResult.renamed ? `${moveResult.result} (kept both)` : moveResult.result;
       showStatus(statusText, "success");
     } catch (error) {
-      const errorMsg = error.toString().toLowerCase();
-      if (errorMsg.includes("used by another process") || errorMsg.includes("permission denied") || errorMsg.includes("access denied")) {
+      console.error("[MOVE] Error moving file:", typeof error, JSON.stringify(error), error);
+      if (isLockedFileError(error)) {
         buttonElement.textContent = "Waiting...";
         showStatus("File is in use - will auto-move when available", "info");
-        retryMoveFile(filePath, destFolder, fileItem, 0, (result) => {
+        retryMoveFile(filePath, destFolder, fileItem, 0, async () => {
           if (aiSuggested && destFolder === aiSuggested) {
-            logCorrection(filename, aiModuleName, destModuleName, "accepted");
+            await logCorrection(filename, aiModuleName, destModuleName, "accepted");
           } else if (aiSuggested) {
-            logCorrection(filename, aiModuleName, destModuleName, "corrected");
+            await logCorrection(filename, aiModuleName, destModuleName, "corrected");
           }
-          const movedDestPath = destFolder + "\\" + filename;
-          addActivityEntry(filename, watchPath, destFolder);
+          const movedDestPath = pathJoin(destFolder, filename);
+          await addActivityEntry(filename, watchPath, destFolder);
           renderActivityLog();
           showUndoToast(filename, movedDestPath, watchPath);
         });
       } else {
-        showStatus(`Failed to move file: ${error}`, "error");
+        showStatus(`Failed to move file: ${getErrorMessage(error)}`, "error");
         buttonElement.disabled = false;
         buttonElement.textContent = "Move";
       }
@@ -1991,15 +1660,15 @@ function initApp() {
 
     const fileItem = buttonElement.closest(".file-item");
     const fileData = detectedFiles.find(f => f.path === filePath);
-    const filename = fileData?.name || filePath.split("\\").pop();
-    const moduleName = suggestedFolder.split("\\").pop();
+    const filename = fileData?.name || pathBasename(filePath);
+    const moduleName = pathBasename(suggestedFolder);
 
     try {
       const moveResult = await moveWithDuplicateCheck(filePath, suggestedFolder, fileData);
       if (!moveResult.success) {
         buttonElement.disabled = false;
         buttonElement.textContent = "Accept";
-        if (moveResult.cancelled) showStatus("Move cancelled", "info");
+        if (moveResult.skipped) showStatus("Move skipped", "info");
         return;
       }
 
@@ -2007,7 +1676,7 @@ function initApp() {
       logCorrection(filename, moduleName, moduleName, "accepted");
 
       // Activity log and undo
-      const movedDestPath = suggestedFolder + "\\" + filename;
+      const movedDestPath = pathJoin(suggestedFolder, filename);
       addActivityEntry(filename, watchPath, suggestedFolder);
       renderActivityLog();
       showUndoToast(filename, movedDestPath, watchPath);
@@ -2016,22 +1685,76 @@ function initApp() {
       const statusText = moveResult.renamed ? `${moveResult.result} (kept both)` : `${moveResult.result} (AI suggestion accepted)`;
       showStatus(statusText, "success");
     } catch (error) {
-      const errorMsg = error.toString().toLowerCase();
-      if (errorMsg.includes("used by another process") || errorMsg.includes("permission denied") || errorMsg.includes("access denied")) {
+      console.error("[ACCEPT] Error accepting file:", typeof error, JSON.stringify(error), error);
+      if (isLockedFileError(error)) {
         buttonElement.textContent = "Waiting...";
         showStatus("File is in use - will auto-move when available", "info");
-        retryMoveFile(filePath, suggestedFolder, fileItem, 0, (result) => {
-          logCorrection(filename, moduleName, moduleName, "accepted");
-          const movedDestPath = suggestedFolder + "\\" + filename;
-          addActivityEntry(filename, watchPath, suggestedFolder);
+        retryMoveFile(filePath, suggestedFolder, fileItem, 0, async (result) => {
+          await logCorrection(filename, moduleName, moduleName, "accepted");
+          const movedDestPath = pathJoin(suggestedFolder, filename);
+          await addActivityEntry(filename, watchPath, suggestedFolder);
           renderActivityLog();
           showUndoToast(filename, movedDestPath, watchPath);
         });
       } else {
-        showStatus(`Failed to move file: ${error}`, "error");
+        showStatus(`Failed to move file: ${getErrorMessage(error)}`, "error");
         buttonElement.disabled = false;
         buttonElement.textContent = "Accept";
       }
+    }
+  }
+
+  // Accept AI suggestion with rename — renames file and moves to suggested folder
+  async function acceptAISuggestionWithRename(filePath, suggestedFolder, newName, buttonElement) {
+    if (!newName || !newName.trim()) {
+      showStatus("Filename cannot be empty", "error");
+      return;
+    }
+
+    buttonElement.disabled = true;
+    buttonElement.textContent = "Renaming...";
+
+    const fileItem = buttonElement.closest(".file-item");
+    const fileData = detectedFiles.find(f => f.path === filePath);
+    const originalFilename = fileData?.name || pathBasename(filePath);
+    const moduleName = pathBasename(suggestedFolder);
+
+    // If name hasn't changed, fall through to regular accept
+    if (newName === originalFilename) {
+      const acceptBtn = fileItem.querySelector(".accept-btn");
+      buttonElement.disabled = false;
+      buttonElement.textContent = "Accept & Rename";
+      acceptAISuggestion(filePath, suggestedFolder, acceptBtn);
+      return;
+    }
+
+    try {
+      await invoke("rename_and_move_file", {
+        filePath,
+        newName,
+        destFolder: suggestedFolder,
+      });
+
+      logCorrection(originalFilename, moduleName, moduleName, "accepted");
+
+      const movedDestPath = pathJoin(suggestedFolder, newName);
+      addActivityEntry(newName, watchPath, suggestedFolder, originalFilename);
+      renderActivityLog();
+      showUndoToast(newName, movedDestPath, watchPath, originalFilename);
+
+      removeFileFromUI(filePath, fileItem);
+      showStatus(`Renamed & moved: ${originalFilename} → ${newName} → ${moduleName}`, "success");
+    } catch (error) {
+      console.error("[RENAME-MOVE] Error:", error);
+      if (isLockedFileError(error)) {
+        showStatus("File is in use — close it and try again", "error");
+      } else if (isDuplicateError(error)) {
+        showStatus(`A file named "${newName}" already exists in ${moduleName}`, "error");
+      } else {
+        showStatus(`Failed: ${getErrorMessage(error)}`, "error");
+      }
+      buttonElement.disabled = false;
+      buttonElement.textContent = "Accept & Rename";
     }
   }
 
@@ -2082,20 +1805,45 @@ function initApp() {
     try {
       const result = await moveWithAutoRename(filePath, destFolder);
 
-      if (onSuccess) onSuccess(result);
+      if (onSuccess) await onSuccess(result);
       removeFileFromUI(filePath, fileItemElement);
       showStatus(`${result} (moved after ${retryCount + 1} retries)`, "success");
     } catch (error) {
-      const errorMsg = error.toString().toLowerCase();
-      if (errorMsg.includes("used by another process") || errorMsg.includes("permission denied") || errorMsg.includes("access denied")) {
+      if (isLockedFileError(error)) {
         retryMoveFile(filePath, destFolder, fileItemElement, retryCount + 1, onSuccess);
       } else {
         if (suggestionDiv) {
           suggestionDiv.innerHTML = `<div class="ai-error">Failed to move: ${escapeHtml(String(error))}</div>`;
         }
-        showStatus(`Failed to move file: ${error}`, "error");
+        showStatus(`Failed to move file: ${getErrorMessage(error)}`, "error");
       }
     }
+  }
+
+  // Dismiss all detected files at once
+  async function dismissAll() {
+    if (detectedFiles.length === 0) {
+      showStatus("No files to dismiss", "info");
+      return;
+    }
+
+    const fileItems = document.querySelectorAll(".file-item");
+    for (const item of fileItems) {
+      const filePath = item.getAttribute("data-file-path");
+      const fileData = detectedFiles.find(f => f.path === filePath);
+      if (fileData) {
+        addToIgnoredList(fileData);
+        logCorrection(fileData.name, "", "dismissed", "dismissed");
+      }
+      item.remove();
+    }
+
+    detectedFiles = [];
+    fileCount.textContent = "0";
+    fileList.innerHTML = '<p class="empty-msg">No files detected yet. Drop a file in your watched folder to test!</p>';
+    updateBatchActions();
+    renderStats();
+    showStatus("All files dismissed", "info");
   }
 
   // Update batch actions visibility
@@ -2103,9 +1851,10 @@ function initApp() {
     const highConfidenceFiles = detectedFiles.filter(f => f.isHighConfidence);
     const count = highConfidenceFiles.length;
 
-    if (count > 0) {
-      batchActions.style.display = "block";
+    if (detectedFiles.length >= 2) {
+      batchActions.style.display = "flex";
       highConfidenceCount.textContent = count;
+      acceptAllHighBtn.style.display = count > 0 ? "" : "none";
     } else {
       batchActions.style.display = "none";
     }
@@ -2148,10 +1897,10 @@ function initApp() {
         await moveWithAutoRename(filePath, suggestedFolder);
 
         const index = detectedFiles.findIndex(f => f.path === filePath);
-        const filename = index > -1 ? detectedFiles[index].name : filePath.split("\\").pop();
+        const filename = index > -1 ? detectedFiles[index].name : pathBasename(filePath);
         if (index > -1) detectedFiles.splice(index, 1);
 
-        addActivityEntry(filename, watchPath, suggestedFolder);
+        await addActivityEntry(filename, watchPath, suggestedFolder);
 
         fileItem.style.opacity = "0";
         setTimeout(() => fileItem.remove(), FILE_REMOVE_ANIMATION_MS);
@@ -2159,9 +1908,12 @@ function initApp() {
       } catch (error) {
         console.error(`Failed to move ${filePath}:`, error);
         failCount++;
-        const errorMsg = error.toString().toLowerCase();
-        if (errorMsg.includes("used by another process") || errorMsg.includes("permission denied") || errorMsg.includes("access denied")) {
-          retryMoveFile(filePath, suggestedFolder, fileItem, 0);
+        if (isLockedFileError(error)) {
+          const retryFilename = filename;
+          retryMoveFile(filePath, suggestedFolder, fileItem, 0, async () => {
+            await addActivityEntry(retryFilename, watchPath, suggestedFolder);
+            renderActivityLog();
+          });
         }
       }
     }
@@ -2207,10 +1959,10 @@ function initApp() {
         await moveWithAutoRename(filePath, suggestedFolder);
 
         const index = detectedFiles.findIndex(f => f.path === filePath);
-        const filename = index > -1 ? detectedFiles[index].name : filePath.split("\\").pop();
+        const filename = index > -1 ? detectedFiles[index].name : pathBasename(filePath);
         if (index > -1) detectedFiles.splice(index, 1);
 
-        addActivityEntry(filename, watchPath, suggestedFolder);
+        await addActivityEntry(filename, watchPath, suggestedFolder);
 
         fileItem.style.opacity = "0";
         setTimeout(() => fileItem.remove(), FILE_REMOVE_ANIMATION_MS);
@@ -2218,9 +1970,12 @@ function initApp() {
       } catch (error) {
         console.error(`Failed to move ${filePath}:`, error);
         failCount++;
-        const errorMsg = error.toString().toLowerCase();
-        if (errorMsg.includes("used by another process") || errorMsg.includes("permission denied") || errorMsg.includes("access denied")) {
-          retryMoveFile(filePath, suggestedFolder, fileItem, 0);
+        if (isLockedFileError(error)) {
+          const retryFilename = filename;
+          retryMoveFile(filePath, suggestedFolder, fileItem, 0, async () => {
+            await addActivityEntry(retryFilename, watchPath, suggestedFolder);
+            renderActivityLog();
+          });
         }
       }
     }
@@ -2248,12 +2003,15 @@ function initApp() {
   }
 
   // Show undo toast after a successful move
-  function showUndoToast(filename, destPath, originalFolder) {
+  function showUndoToast(filename, destPath, originalFolder, originalFilename = null) {
     // Cancel any existing undo timer
     cancelUndo();
 
-    lastMove = { filename, destPath, originalFolder, timestamp: Date.now() };
-    undoToastMsg.textContent = `Moved "${filename}"`;
+    lastMove = { filename, destPath, originalFolder, originalFilename, timestamp: Date.now() };
+    const msg = originalFilename && originalFilename !== filename
+      ? `Renamed "${originalFilename}" → "${filename}" and moved`
+      : `Moved "${filename}"`;
+    undoToastMsg.textContent = msg;
     undoToast.style.display = "flex";
 
     let secondsLeft = UNDO_TIMEOUT_MS / 1000;
@@ -2289,20 +2047,40 @@ function initApp() {
   async function handleUndo() {
     if (!lastMove) return;
 
-    const { filename, destPath, originalFolder, timestamp } = lastMove;
+    const { filename, destPath, originalFolder, originalFilename, timestamp } = lastMove;
     cancelUndo();
 
     try {
-      const result = await invoke("undo_move", {
+      // Step 1: Move file back to original folder
+      await invoke("undo_move", {
         filePath: destPath,
         originalFolder: originalFolder,
       });
 
+      // Step 2: If it was renamed, restore the original filename
+      if (originalFilename && originalFilename !== filename) {
+        try {
+          await invoke("rename_file", {
+            filePath: pathJoin(originalFolder, filename),
+            newName: originalFilename,
+          });
+        } catch (renameError) {
+          console.error("[UNDO] Rename-back failed:", renameError);
+          showStatus(`File moved back but rename failed: ${getErrorMessage(renameError)}`, "error");
+          markActivityUndone(timestamp);
+          renderActivityLog();
+          return;
+        }
+      }
+
       markActivityUndone(timestamp);
       renderActivityLog();
-      showStatus(`Undo: "${filename}" restored`, "success");
+      const undoMsg = originalFilename && originalFilename !== filename
+        ? `Undo: "${originalFilename}" restored (name and location)`
+        : `Undo: "${filename}" restored`;
+      showStatus(undoMsg, "success");
     } catch (error) {
-      showStatus(`Undo failed: ${error}`, "error");
+      showStatus(`Undo failed: ${getErrorMessage(error)}`, "error");
     }
   }
 
@@ -2313,6 +2091,7 @@ function initApp() {
     if (activityLog.length === 0) {
       activityList.innerHTML = '<p class="empty-msg">No activity yet.</p>';
       clearActivityBtn.style.display = "none";
+      renderStats();
       return;
     }
 
@@ -2329,11 +2108,13 @@ function initApp() {
       const timeStr = time.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
       const dateStr = isToday(time) ? "Today" : time.toLocaleDateString([], { month: "short", day: "numeric" });
 
-      const toName = entry.to.split("\\").pop();
+      const toName = pathBasename(entry.to);
+      const wasRenamed = entry.originalFilename && entry.originalFilename !== entry.filename;
 
       item.innerHTML = `
         <span class="activity-time">${dateStr} ${timeStr}</span>
-        <span class="activity-desc">${escapeHtml(entry.filename)} → <strong>${escapeHtml(toName)}</strong></span>
+        <span class="activity-desc">${wasRenamed ? `${escapeHtml(entry.originalFilename)} → ${escapeHtml(entry.filename)}` : escapeHtml(entry.filename)} → <strong>${escapeHtml(toName)}</strong></span>
+        ${wasRenamed ? '<span class="rename-badge">renamed</span>' : ""}
         ${entry.undone ? '<span class="activity-undone-badge">undone</span>' : ""}
         <button class="folder-link-btn" title="Open folder in Explorer" aria-label="Open folder in Explorer">&#128193;</button>
       `;
@@ -2354,17 +2135,66 @@ function initApp() {
       more.textContent = `+ ${activityLog.length - 20} older entries`;
       activityList.appendChild(more);
     }
+
+    renderStats();
   }
 
   // isToday is imported from utils.js
 
-  // Show status message
+  // Render statistics dashboard
+  function renderStats() {
+    const statsSection = document.getElementById("stats-section");
+    const statsGrid = document.getElementById("stats-grid");
+    if (!statsSection || !statsGrid) return;
+
+    const total = activityLog.filter(e => !e.undone).length;
+    const accepted = correctionLog.filter(c => c.type === "accepted").length;
+    const corrected = correctionLog.filter(c => c.type === "corrected").length;
+    const dismissed = correctionLog.filter(c => c.type === "dismissed").length;
+    const accuracy = (accepted + corrected) > 0
+      ? Math.round((accepted / (accepted + corrected)) * 100) : 0;
+
+    const folderCounts = {};
+    for (const e of activityLog.filter(e => !e.undone)) {
+      const name = pathBasename(e.to);
+      folderCounts[name] = (folderCounts[name] || 0) + 1;
+    }
+    const topFolders = Object.entries(folderCounts)
+      .sort((a, b) => b[1] - a[1]).slice(0, 5);
+
+    statsGrid.innerHTML = `
+      <div class="stat-card"><div class="stat-value">${total}</div><div class="stat-label">Files Organized</div></div>
+      <div class="stat-card"><div class="stat-value">${accuracy}%</div><div class="stat-label">AI Accuracy</div></div>
+      <div class="stat-card"><div class="stat-value">${accepted}</div><div class="stat-label">Accepted</div></div>
+      <div class="stat-card"><div class="stat-value">${corrected}</div><div class="stat-label">Corrected</div></div>
+      <div class="stat-card"><div class="stat-value">${dismissed}</div><div class="stat-label">Dismissed</div></div>
+      ${topFolders.length ? `<div class="stat-card wide"><div class="stat-label">Top Folders</div>
+        <div class="top-folders">${topFolders.map(([name, count]) =>
+          `<span class="top-folder">${escapeHtml(name)} <small>(${count})</small></span>`
+        ).join("")}</div></div>` : ""}
+    `;
+    statsSection.style.display = total > 0 || correctionLog.length > 0 ? "block" : "none";
+  }
+
+  // Show status message with dismiss button
   function showStatus(message, type = "info") {
-    statusMsg.textContent = message;
+    statusMsg.innerHTML = "";
+    const textSpan = document.createElement("span");
+    textSpan.textContent = message;
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "status-close-btn";
+    closeBtn.textContent = "\u00D7";
+    closeBtn.title = "Dismiss";
+    closeBtn.addEventListener("click", () => {
+      statusMsg.innerHTML = "";
+      statusMsg.className = "status-msg";
+    });
+    statusMsg.appendChild(textSpan);
+    statusMsg.appendChild(closeBtn);
     statusMsg.className = `status-msg ${type}`;
     setTimeout(() => {
-      if (statusMsg.textContent === message) {
-        statusMsg.textContent = "";
+      if (textSpan.isConnected && textSpan.textContent === message) {
+        statusMsg.innerHTML = "";
         statusMsg.className = "status-msg";
       }
     }, STATUS_TIMEOUT_MS);
@@ -2380,8 +2210,9 @@ function initApp() {
           <h3>File Already Exists</h3>
           <p>A file named <strong>${escapeHtml(filename)}</strong> already exists in the destination folder.</p>
           <div class="dialog-actions">
+            <button class="dialog-btn dialog-btn-danger" data-action="replace">Replace</button>
             <button class="dialog-btn dialog-btn-primary" data-action="keep-both">Keep Both</button>
-            <button class="dialog-btn dialog-btn-secondary" data-action="cancel">Cancel</button>
+            <button class="dialog-btn dialog-btn-secondary" data-action="skip">Skip</button>
           </div>
         </div>
       `;
@@ -2402,15 +2233,17 @@ function initApp() {
       const result = await invoke("move_file", { sourcePath, destFolder });
       return { success: true, result };
     } catch (error) {
-      const errorMsg = error.toString();
-      if (errorMsg.includes("File already exists at destination")) {
-        const filename = fileData?.name || sourcePath.split("\\").pop();
+      if (isDuplicateError(error)) {
+        const filename = fileData?.name || pathBasename(sourcePath);
         const action = await showDuplicateDialog(filename);
-        if (action === "keep-both") {
+        if (action === "replace") {
+          const result = await invoke("replace_file", { sourcePath, destFolder });
+          return { success: true, result, replaced: true };
+        } else if (action === "keep-both") {
           const result = await invoke("move_file_with_rename", { sourcePath, destFolder });
           return { success: true, result, renamed: true };
         }
-        return { success: false, cancelled: true };
+        return { success: false, skipped: true };
       }
       throw error;
     }
@@ -2422,8 +2255,7 @@ function initApp() {
       const result = await invoke("move_file", { sourcePath, destFolder });
       return result;
     } catch (error) {
-      const errorMsg = error.toString();
-      if (errorMsg.includes("File already exists at destination")) {
+      if (isDuplicateError(error)) {
         return await invoke("move_file_with_rename", { sourcePath, destFolder });
       }
       throw error;

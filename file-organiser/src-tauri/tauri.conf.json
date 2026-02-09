@@ -9,7 +9,7 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
     "windows": [
       {
         "title": "File Organizer",
@@ -27,7 +27,10 @@
             "dialog:allow-open",
             "dialog:default",
             "core:default",
-            "notification:default"
+            "notification:default",
+            "autostart:allow-enable",
+            "autostart:allow-disable",
+            "autostart:allow-is-enabled"
           ]
         }
       ]

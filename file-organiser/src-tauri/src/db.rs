@@ -40,6 +40,14 @@ impl From<rusqlite::Error> for DbError {
 // ============================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Rule {
+    pub id: Option<i64>,
+    pub pattern: String,
+    pub target_folder: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Correction {
     pub id: Option<i64>,
     pub filename: String,
@@ -53,6 +61,7 @@ pub struct Correction {
 pub struct ActivityEntry {
     pub id: Option<i64>,
     pub filename: String,
+    pub original_filename: Option<String>,
     pub from_folder: String,
     pub to_folder: String,
     pub undone: bool,
@@ -126,9 +135,38 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_activity_created_at
                 ON activity_log(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pattern TEXT NOT NULL,
+                target_folder TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
         ",
         )
         .map_err(|e| DbError::InitFailed(e.to_string()))?;
+
+        // Migration: add original_filename column for smart rename tracking
+        let has_column: bool = conn
+            .prepare("PRAGMA table_info(activity_log)")
+            .and_then(|mut stmt| {
+                let names: Vec<String> = stmt
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(names.contains(&"original_filename".to_string()))
+            })
+            .unwrap_or(false);
+
+        if !has_column {
+            conn.execute_batch("ALTER TABLE activity_log ADD COLUMN original_filename TEXT;")
+                .map_err(|e| DbError::InitFailed(e.to_string()))?;
+        }
 
         Ok(())
     }
@@ -206,10 +244,11 @@ impl Database {
         let conn = self.conn.lock().unwrap();
 
         conn.execute(
-            "INSERT INTO activity_log (filename, from_folder, to_folder, undone, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO activity_log (filename, original_filename, from_folder, to_folder, undone, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 entry.filename,
+                entry.original_filename,
                 entry.from_folder,
                 entry.to_folder,
                 entry.undone as i32,
@@ -234,7 +273,7 @@ impl Database {
     pub fn get_activity_log(&self) -> Result<Vec<ActivityEntry>, DbError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, filename, from_folder, to_folder, undone, created_at
+            "SELECT id, filename, original_filename, from_folder, to_folder, undone, created_at
              FROM activity_log ORDER BY created_at DESC",
         )?;
 
@@ -243,10 +282,11 @@ impl Database {
                 Ok(ActivityEntry {
                     id: Some(row.get(0)?),
                     filename: row.get(1)?,
-                    from_folder: row.get(2)?,
-                    to_folder: row.get(3)?,
-                    undone: row.get::<_, i32>(4)? != 0,
-                    created_at: row.get(5)?,
+                    original_filename: row.get(2)?,
+                    from_folder: row.get(3)?,
+                    to_folder: row.get(4)?,
+                    undone: row.get::<_, i32>(5)? != 0,
+                    created_at: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -269,6 +309,83 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM activity_log", [])?;
         Ok(())
+    }
+
+    // --------------------------------------------------------
+    // MIGRATION FROM LOCALSTORAGE
+    // --------------------------------------------------------
+
+    // --------------------------------------------------------
+    // SETTINGS
+    // --------------------------------------------------------
+
+    /// Store a setting value
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve a setting value
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?1")?;
+        match stmt.query_row(params![key], |row| row.get(0)) {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(DbError::QueryFailed(e.to_string())),
+        }
+    }
+
+    // --------------------------------------------------------
+    // RULES
+    // --------------------------------------------------------
+
+    /// Add a classification rule
+    pub fn add_rule(&self, pattern: &str, target_folder: &str) -> Result<i64, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        conn.execute(
+            "INSERT INTO rules (pattern, target_folder, created_at) VALUES (?1, ?2, ?3)",
+            params![pattern, target_folder, now],
+        )?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get all classification rules
+    pub fn get_rules(&self) -> Result<Vec<Rule>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, pattern, target_folder, created_at FROM rules ORDER BY created_at ASC",
+        )?;
+
+        let rules = stmt
+            .query_map([], |row| {
+                Ok(Rule {
+                    id: Some(row.get(0)?),
+                    pattern: row.get(1)?,
+                    target_folder: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(rules)
+    }
+
+    /// Delete a rule by id
+    pub fn delete_rule(&self, id: i64) -> Result<bool, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute("DELETE FROM rules WHERE id = ?1", params![id])?;
+        Ok(deleted > 0)
     }
 
     // --------------------------------------------------------
@@ -307,10 +424,11 @@ impl Database {
         for e in entries {
             conn.execute(
                 "INSERT OR IGNORE INTO activity_log
-                 (filename, from_folder, to_folder, undone, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (filename, original_filename, from_folder, to_folder, undone, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     e.filename,
+                    e.original_filename,
                     e.from_folder,
                     e.to_folder,
                     e.undone as i32,
@@ -422,6 +540,7 @@ mod tests {
         let entry = ActivityEntry {
             id: None,
             filename: "notes.pdf".to_string(),
+            original_filename: None,
             from_folder: "Downloads".to_string(),
             to_folder: "Math".to_string(),
             undone: false,
@@ -444,6 +563,7 @@ mod tests {
         let entry = ActivityEntry {
             id: None,
             filename: "notes.pdf".to_string(),
+            original_filename: None,
             from_folder: "Downloads".to_string(),
             to_folder: "Math".to_string(),
             undone: false,
@@ -474,6 +594,7 @@ mod tests {
             let entry = ActivityEntry {
                 id: None,
                 filename: format!("file{}.pdf", i),
+                original_filename: None,
                 from_folder: "Downloads".to_string(),
                 to_folder: "Folder".to_string(),
                 undone: false,
@@ -527,6 +648,7 @@ mod tests {
             ActivityEntry {
                 id: None,
                 filename: "a.pdf".to_string(),
+                original_filename: None,
                 from_folder: "Downloads".to_string(),
                 to_folder: "Math".to_string(),
                 undone: false,
@@ -535,6 +657,7 @@ mod tests {
             ActivityEntry {
                 id: None,
                 filename: "b.pdf".to_string(),
+                original_filename: None,
                 from_folder: "Downloads".to_string(),
                 to_folder: "Physics".to_string(),
                 undone: true,
@@ -548,5 +671,37 @@ mod tests {
         let result = db.get_activity_log().unwrap();
         assert_eq!(result.len(), 2);
         assert!(result[0].undone || result[1].undone); // One should be undone
+    }
+
+    #[test]
+    fn test_add_and_get_rules() {
+        let db = temp_db();
+
+        let id1 = db.add_rule("*_ML_*", "C:\\Courses\\ML").unwrap();
+        let id2 = db.add_rule("Lecture*", "C:\\Courses\\Lectures").unwrap();
+        assert!(id1 > 0);
+        assert!(id2 > 0);
+
+        let rules = db.get_rules().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].pattern, "*_ML_*");
+        assert_eq!(rules[1].pattern, "Lecture*");
+    }
+
+    #[test]
+    fn test_delete_rule() {
+        let db = temp_db();
+
+        let id = db.add_rule("*.pdf", "C:\\PDFs").unwrap();
+        assert!(db.delete_rule(id).unwrap());
+
+        let rules = db.get_rules().unwrap();
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn test_delete_nonexistent_rule() {
+        let db = temp_db();
+        assert!(!db.delete_rule(999).unwrap());
     }
 }
