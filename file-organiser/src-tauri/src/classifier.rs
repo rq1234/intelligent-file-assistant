@@ -2,7 +2,6 @@
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -75,6 +74,7 @@ pub struct Classification {
     pub suggested_folder: String,
     pub confidence: f32,
     pub reasoning: String,
+    pub suggested_filename: Option<String>,
 }
 
 // --- Request types for text-only (GPT-3.5) ---
@@ -146,6 +146,7 @@ struct GptResponse {
     folder: String,
     confidence: f32,
     reasoning: String,
+    suggested_filename: Option<String>,
 }
 
 enum PromptMode {
@@ -204,17 +205,19 @@ Respond with ONLY a JSON object in this format:
   "is_relevant": true,
   "folder": "suggested folder path",
   "confidence": 0.95,
-  "reasoning": "brief explanation"
+  "reasoning": "brief explanation",
+  "suggested_filename": "Better_Name.pdf"
 }}
 
 Rules:
 - is_relevant: true if the file is educational material (lecture slides, notes, assignments, textbooks, academic papers, course-related documents, ChatGPT conversations about coursework, screenshots of lecture content, screenshots of formulas/equations, screenshots of code/tutorials, screenshots of academic websites or textbook pages). Set false for memes, entertainment, games, personal photos, installers, music, videos unrelated to courses, social media content, screenshots of non-academic things like social media or shopping, etc.
 - If is_relevant is false, set folder to "" and confidence to 0
-- If is_relevant is true and the file clearly belongs to one of the available folders, use the exact folder path from the list
+- If is_relevant is true and the file clearly belongs to one of the available folders, the "folder" field MUST be the EXACT FULL PATH copied verbatim from the list above (e.g. "C:\\Users\\...\\Machine Learning", NOT just "Machine Learning")
 - If is_relevant is true but the file does NOT fit any of the available folders, set folder to "__UNSORTED__" — do NOT force-fit it into an unrelated folder
 - confidence should be 0-1 (1 = very confident)
 - Consider file extension, name patterns, and common use cases
-- Be concise in reasoning{corrections}"#,
+- Be concise in reasoning
+- suggested_filename: OPTIONAL. Only include if the current filename is genuinely uninformative (e.g. IMG_*, screenshot*, random strings, numbered files like document(1).pdf). If the filename is already descriptive, omit this field or set it to null. Keep the same file extension. Use underscores between words, max 80 characters{corrections}"#,
         content_instruction = content_instruction,
         filename = filename,
         content_section = content_section,
@@ -256,6 +259,7 @@ fn parse_response(content: &str) -> Result<Classification, ClassifierError> {
         suggested_folder: gpt_response.folder,
         confidence,
         reasoning: gpt_response.reasoning,
+        suggested_filename: gpt_response.suggested_filename,
     })
 }
 
@@ -319,11 +323,9 @@ pub async fn classify_file(
     available_folders: Vec<String>,
     correction_history: Vec<String>,
 ) -> Result<Classification, String> {
-    let api_key = if api_key.is_empty() {
-        env::var("OPENAI_API_KEY").map_err(|_| ClassifierError::MissingApiKey.to_string())?
-    } else {
-        api_key
-    };
+    if api_key.is_empty() {
+        return Err(ClassifierError::MissingApiKey.to_string());
+    }
 
     let prompt = build_prompt(&filename, &available_folders, &correction_history, PromptMode::FilenameOnly);
 
@@ -353,11 +355,9 @@ async fn classify_image_file_impl(
     available_folders: Vec<String>,
     correction_history: Vec<String>,
 ) -> Result<Classification, ClassifierError> {
-    let api_key = if api_key.is_empty() {
-        env::var("OPENAI_API_KEY").map_err(|_| ClassifierError::MissingApiKey)?
-    } else {
-        api_key
-    };
+    if api_key.is_empty() {
+        return Err(ClassifierError::MissingApiKey);
+    }
 
     // Check file size before reading
     let metadata = std::fs::metadata(&file_path)
@@ -622,6 +622,7 @@ mod tests {
             suggested_folder: "ML".to_string(),
             confidence: 0.9,
             reasoning: "test".to_string(),
+            suggested_filename: None,
         };
         let json = serde_json::to_string(&c).unwrap();
         assert!(json.contains("\"is_relevant\":true"));
@@ -644,6 +645,7 @@ mod tests {
             suggested_folder: "Physics".to_string(),
             confidence: 0.85,
             reasoning: "physics material".to_string(),
+            suggested_filename: Some("Physics_Lecture_Notes.pdf".to_string()),
         };
         let c2 = c.clone();
         assert_eq!(c.suggested_folder, c2.suggested_folder);
@@ -727,11 +729,9 @@ pub async fn classify_with_text_content(
     available_folders: Vec<String>,
     correction_history: Vec<String>,
 ) -> Result<Classification, String> {
-    let api_key = if api_key.is_empty() {
-        env::var("OPENAI_API_KEY").map_err(|_| ClassifierError::MissingApiKey.to_string())?
-    } else {
-        api_key
-    };
+    if api_key.is_empty() {
+        return Err(ClassifierError::MissingApiKey.to_string());
+    }
 
     let prompt = build_prompt(
         &filename,

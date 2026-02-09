@@ -3,10 +3,10 @@ mod watcher;  // Import our file watcher module
 mod classifier;  // Import AI classifier module
 mod db;  // SQLite database module
 
-use db::{ActivityEntry, Correction, Database, DbError};
+use db::{ActivityEntry, Correction, Database, DbError, Rule};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::Emitter;
 use tauri::Manager;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
@@ -15,6 +15,9 @@ use thiserror::Error;
 
 // Global database instance
 static DATABASE: OnceLock<Arc<Database>> = OnceLock::new();
+
+// Secure API key storage (only traverses IPC once via set_api_key)
+static API_KEY: OnceLock<Mutex<String>> = OnceLock::new();
 
 // Track if we've shown the "minimized to tray" notification
 static SHOWN_TRAY_HINT: AtomicBool = AtomicBool::new(false);
@@ -89,19 +92,26 @@ fn validate_path(path: &str) -> Result<std::path::PathBuf, CommandError> {
     }
     let p = std::path::Path::new(path);
     if !p.exists() {
-        // For paths that don't exist yet, canonicalize the parent
-        if let Some(parent) = p.parent() {
+        // Walk up to find the nearest existing ancestor and canonicalize it
+        let mut check = p.to_path_buf();
+        while let Some(parent) = check.parent() {
             if parent.exists() {
-                let canonical_parent = parent.canonicalize()
+                let canonical = parent.canonicalize()
                     .map_err(|e| CommandError::InvalidPath(format!("Failed to resolve path: {}", e)))?;
-                if canonical_parent.to_string_lossy().contains("..") {
+                if canonical.to_string_lossy().contains("..") {
                     return Err(CommandError::PathTraversal);
                 }
-                return Ok(canonical_parent.join(p.file_name().unwrap_or_default()));
+                return Ok(p.to_path_buf());
             }
+            if parent == check {
+                break; // reached root
+            }
+            check = parent.to_path_buf();
         }
-        // Parent doesn't exist either — just do the string check
-        return Ok(p.to_path_buf());
+        // No existing ancestor found (e.g., invalid drive letter)
+        return Err(CommandError::InvalidPath(
+            "Path has no valid ancestor directory".to_string(),
+        ));
     }
     let canonical = p.canonicalize()
         .map_err(|e| CommandError::InvalidPath(format!("Failed to resolve path: {}", e)))?;
@@ -272,17 +282,95 @@ fn move_file_with_rename(source_path: String, dest_folder: String) -> Result<Str
     Ok(format!("Moved to {}", dest_path.display()))
 }
 
+/// Replace an existing file at the destination with the source file.
+/// Called from frontend with: invoke('replace_file', { sourcePath: '...', destFolder: '...' })
+#[tauri::command]
+fn replace_file(source_path: String, dest_folder: String) -> Result<String, CommandError> {
+    use std::fs;
+
+    println!("[COMMAND] replace_file: {} -> {}", source_path, dest_folder);
+
+    let source = validate_path(&source_path)?;
+    if !source.exists() {
+        return Err(CommandError::FileNotFound(source_path));
+    }
+    if !source.is_file() {
+        return Err(CommandError::InvalidPath(format!("Source is not a file: {}", source_path)));
+    }
+
+    let dest_dir = validate_path(&dest_folder)?;
+    let filename = source.file_name()
+        .ok_or_else(|| CommandError::InvalidPath("Invalid source file path".to_string()))?;
+    let dest_path = dest_dir.join(filename);
+
+    // Remove existing file if it exists
+    if dest_path.exists() {
+        fs::remove_file(&dest_path)?;
+    }
+
+    fs::rename(&source, &dest_path)?;
+
+    println!("[COMMAND] File replaced at: {}", dest_path.display());
+    Ok(format!("Replaced {}", dest_path.display()))
+}
+
+/// Get the stored API key from the in-memory cache
+fn get_stored_api_key() -> Result<String, String> {
+    let key = API_KEY
+        .get()
+        .ok_or_else(|| "API key storage not initialized".to_string())?
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if key.is_empty() {
+        Err("No API key configured. Please set your OpenAI API key in Settings.".to_string())
+    } else {
+        Ok(key)
+    }
+}
+
+/// Store the API key securely on the Rust side
+///
+/// The key is held in memory and persisted to the SQLite database.
+/// This avoids passing it over IPC on every classify call.
+#[tauri::command]
+fn set_api_key(key: String) -> Result<(), String> {
+    // Store in memory
+    if let Some(mutex) = API_KEY.get() {
+        let mut stored = mutex.lock().unwrap_or_else(|e| e.into_inner());
+        *stored = key.clone();
+    }
+    // Persist to database
+    if let Ok(db) = get_db() {
+        db.set_setting("api_key", &key)
+            .map_err(|e| format!("Failed to save API key: {}", e))?;
+    }
+    Ok(())
+}
+
+/// Check if an API key is stored (returns the key for settings display)
+#[tauri::command]
+fn get_api_key() -> Result<String, String> {
+    let key = API_KEY
+        .get()
+        .ok_or_else(|| "Not initialized".to_string())?
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    Ok(key)
+}
+
 /// Classify a file using AI
 ///
-/// Called from frontend with: invoke('classify_file', { apiKey: '...', filename: '...', availableFolders: [...], correctionHistory: [...] })
+/// Called from frontend with: invoke('classify_file', { filename: '...', availableFolders: [...], correctionHistory: [...] })
 #[tauri::command]
 async fn classify_file(
-    api_key: String,
     filename: String,
     available_folders: Vec<String>,
     correction_history: Vec<String>,
 ) -> Result<classifier::Classification, String> {
     println!("[COMMAND] classify_file: {} (with {} corrections)", filename, correction_history.len());
+    let api_key = get_stored_api_key()?;
 
     classifier::classify_file(api_key, filename, available_folders, correction_history).await
 }
@@ -293,13 +381,15 @@ async fn classify_file(
 /// Returns error if OCR extracts too little text (caller should fall back to vision).
 #[tauri::command]
 async fn classify_image_with_ocr(
-    api_key: String,
     file_path: String,
     filename: String,
     available_folders: Vec<String>,
     correction_history: Vec<String>,
 ) -> Result<classifier::Classification, String> {
     println!("[COMMAND] classify_image_with_ocr: {} (OCR mode)", filename);
+    let api_key = get_stored_api_key()?;
+    let validated = validate_path(&file_path).map_err(|e| format!("{}", e))?;
+    let file_path = validated.to_string_lossy().to_string();
 
     // Extract text using Tesseract OCR
     let text_content = classifier::extract_image_text(&file_path)?;
@@ -319,13 +409,15 @@ async fn classify_image_with_ocr(
 /// Called from frontend with: invoke('classify_image_file', { apiKey: '...', filePath: '...', filename: '...', availableFolders: [...], correctionHistory: [...] })
 #[tauri::command]
 async fn classify_image_file(
-    api_key: String,
     file_path: String,
     filename: String,
     available_folders: Vec<String>,
     correction_history: Vec<String>,
 ) -> Result<classifier::Classification, String> {
     println!("[COMMAND] classify_image_file: {} (vision mode)", filename);
+    let api_key = get_stored_api_key()?;
+    let validated = validate_path(&file_path).map_err(|e| format!("{}", e))?;
+    let file_path = validated.to_string_lossy().to_string();
 
     classifier::classify_image_file(api_key, file_path, filename, available_folders, correction_history).await
 }
@@ -335,13 +427,15 @@ async fn classify_image_file(
 /// Called from frontend with: invoke('classify_with_content', { filePath: '...', filename: '...', availableFolders: [...], correctionHistory: [...] })
 #[tauri::command]
 async fn classify_with_content(
-    api_key: String,
     file_path: String,
     filename: String,
     available_folders: Vec<String>,
     correction_history: Vec<String>,
 ) -> Result<classifier::Classification, String> {
     println!("[COMMAND] classify_with_content: {} (content extraction mode)", filename);
+    let api_key = get_stored_api_key()?;
+    let validated = validate_path(&file_path).map_err(|e| format!("{}", e))?;
+    let file_path = validated.to_string_lossy().to_string();
 
     // Determine file type and extract text
     let ext = file_path.rsplit('.').next().unwrap_or("").to_lowercase();
@@ -370,13 +464,13 @@ async fn classify_with_content(
 
 /// Scan a directory and return list of subdirectories
 ///
-/// Called from frontend with: invoke('scan_folders', { path: '...' })
+/// Called from frontend with: invoke('scan_folders', { path: '...', recursive: true })
 #[tauri::command]
-fn scan_folders(path: String) -> Result<Vec<String>, String> {
+fn scan_folders(path: String, recursive: Option<bool>) -> Result<Vec<String>, String> {
     use std::fs;
     use std::path::Path;
 
-    println!("[COMMAND] scan_folders: {}", path);
+    println!("[COMMAND] scan_folders: {} (recursive: {:?})", path, recursive);
 
     let dir = Path::new(&path);
 
@@ -390,27 +484,51 @@ fn scan_folders(path: String) -> Result<Vec<String>, String> {
 
     let mut folders = Vec::new();
 
-    match fs::read_dir(dir) {
-        Ok(entries) => {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        if let Some(folder_name) = path.file_name() {
-                            if let Some(name_str) = folder_name.to_str() {
-                                folders.push(name_str.to_string());
+    if recursive.unwrap_or(false) {
+        collect_folders_recursive(dir, dir, &mut folders)?;
+    } else {
+        match fs::read_dir(dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    if let Ok(entry) = entry {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            if let Some(folder_name) = path.file_name() {
+                                if let Some(name_str) = folder_name.to_str() {
+                                    folders.push(name_str.to_string());
+                                }
                             }
                         }
                     }
                 }
             }
+            Err(e) => return Err(format!("Failed to read directory: {}", e)),
         }
-        Err(e) => return Err(format!("Failed to read directory: {}", e)),
     }
 
     folders.sort();
     println!("[COMMAND] Found {} folders", folders.len());
     Ok(folders)
+}
+
+fn collect_folders_recursive(
+    base: &std::path::Path,
+    current: &std::path::Path,
+    folders: &mut Vec<String>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(current).map_err(|e| e.to_string())?;
+    for entry in entries {
+        if let Ok(entry) = entry {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(name) = path.strip_prefix(base).ok().and_then(|r| r.to_str()) {
+                    folders.push(name.to_string());
+                }
+                collect_folders_recursive(base, &path, folders)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Get a preview of a file's content
@@ -421,6 +539,10 @@ fn scan_folders(path: String) -> Result<Vec<String>, String> {
 #[tauri::command]
 fn get_file_preview(file_path: String) -> Result<FilePreview, String> {
     use base64::Engine;
+
+    // Validate path to prevent arbitrary file reads
+    let validated = validate_path(&file_path).map_err(|e| format!("{}", e))?;
+    let file_path = validated.to_string_lossy().to_string();
 
     let ext = file_path.rsplit('.').next().unwrap_or("").to_lowercase();
 
@@ -673,6 +795,82 @@ fn rename_file(file_path: String, new_name: String) -> Result<String, CommandErr
     Ok(new_path_str)
 }
 
+/// Rename a file and move it to a destination folder (atomic: rollback rename if move fails)
+///
+/// Called from frontend with: invoke('rename_and_move_file', { filePath: '...', newName: '...', destFolder: '...' })
+#[tauri::command]
+fn rename_and_move_file(file_path: String, new_name: String, dest_folder: String) -> Result<String, CommandError> {
+    use std::fs;
+    use std::path::Path;
+
+    println!("[COMMAND] rename_and_move_file: {} -> {} into {}", file_path, new_name, dest_folder);
+
+    // Validate file path
+    let _ = validate_path(&file_path)?;
+
+    // Validate new name (same checks as rename_file)
+    if new_name.contains("..") {
+        return Err(CommandError::PathTraversal);
+    }
+    if new_name.contains('/') || new_name.contains('\\') {
+        return Err(CommandError::InvalidPath("New name cannot contain path separators".to_string()));
+    }
+    let invalid_chars = ['<', '>', ':', '"', '|', '?', '*'];
+    if new_name.chars().any(|c| invalid_chars.contains(&c)) {
+        return Err(CommandError::InvalidPath("New name contains invalid characters".to_string()));
+    }
+    if new_name.trim().is_empty() {
+        return Err(CommandError::InvalidPath("New name cannot be empty".to_string()));
+    }
+
+    // Validate source exists
+    let source = Path::new(&file_path);
+    if !source.exists() {
+        return Err(CommandError::FileNotFound(file_path));
+    }
+    if !source.is_file() {
+        return Err(CommandError::InvalidPath(format!("Path is not a file: {}", file_path)));
+    }
+
+    // Step 1: Rename in place
+    let parent = source.parent()
+        .ok_or_else(|| CommandError::InvalidPath("Cannot determine parent directory".to_string()))?;
+    let renamed_path = parent.join(&new_name);
+
+    if renamed_path.exists() {
+        return Err(CommandError::DuplicateExists(new_name.clone()));
+    }
+
+    fs::rename(&source, &renamed_path)?;
+    println!("[COMMAND] Step 1 - Renamed to: {}", renamed_path.display());
+
+    // Step 2: Move renamed file to dest_folder
+    let dest_dir = Path::new(&dest_folder);
+    if !dest_dir.exists() {
+        // Rollback rename before returning error
+        let _ = fs::rename(&renamed_path, &source);
+        return Err(CommandError::FileNotFound(dest_folder));
+    }
+
+    let final_path = dest_dir.join(&new_name);
+    if final_path.exists() {
+        // Rollback rename before returning error
+        let _ = fs::rename(&renamed_path, &source);
+        return Err(CommandError::DuplicateExists(new_name));
+    }
+
+    if let Err(e) = fs::rename(&renamed_path, &final_path) {
+        // Rollback rename
+        println!("[COMMAND] Move failed, rolling back rename: {}", e);
+        let _ = fs::rename(&renamed_path, &source);
+        return Err(CommandError::IoError(e.to_string()));
+    }
+
+    let final_path_str = final_path.to_string_lossy().to_string();
+    println!("[COMMAND] Step 2 - Moved to: {}", final_path_str);
+    Ok(final_path_str)
+}
+
 /// Create a folder if it doesn't exist
 ///
 /// Called from frontend with: invoke('create_folder', { path: '...' })
@@ -766,6 +964,7 @@ fn db_add_activity(
     filename: String,
     from_folder: String,
     to_folder: String,
+    original_filename: Option<String>,
 ) -> Result<i64, DbError> {
     let db = get_db()?;
     db.add_activity(ActivityEntry {
@@ -775,6 +974,7 @@ fn db_add_activity(
         to_folder,
         undone: false,
         created_at: current_timestamp_ms(),
+        original_filename,
     })
 }
 
@@ -797,6 +997,27 @@ fn db_mark_activity_undone(timestamp: i64) -> Result<bool, DbError> {
 fn db_clear_activity_log() -> Result<(), DbError> {
     let db = get_db()?;
     db.clear_activity_log()
+}
+
+/// Add a classification rule
+#[tauri::command]
+fn db_add_rule(pattern: String, target_folder: String) -> Result<i64, DbError> {
+    let db = get_db()?;
+    db.add_rule(&pattern, &target_folder)
+}
+
+/// Get all classification rules
+#[tauri::command]
+fn db_get_rules() -> Result<Vec<Rule>, DbError> {
+    let db = get_db()?;
+    db.get_rules()
+}
+
+/// Delete a classification rule
+#[tauri::command]
+fn db_delete_rule(id: i64) -> Result<bool, DbError> {
+    let db = get_db()?;
+    db.delete_rule(id)
 }
 
 /// Import data from localStorage (migration)
@@ -832,7 +1053,7 @@ mod tests {
         // Also create a file (should NOT appear in results)
         fs::write(tmp.join("readme.txt"), "hello").unwrap();
 
-        let result = super::scan_folders(tmp.to_string_lossy().to_string()).unwrap();
+        let result = super::scan_folders(tmp.to_string_lossy().to_string(), None).unwrap();
         assert_eq!(result, vec!["Alpha", "Middle", "Zebra"]);
 
         let _ = fs::remove_dir_all(&tmp);
@@ -844,7 +1065,7 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 
-        let result = super::scan_folders(tmp.to_string_lossy().to_string()).unwrap();
+        let result = super::scan_folders(tmp.to_string_lossy().to_string(), None).unwrap();
         assert!(result.is_empty());
 
         let _ = fs::remove_dir_all(&tmp);
@@ -852,7 +1073,7 @@ mod tests {
 
     #[test]
     fn test_scan_folders_nonexistent_path() {
-        let result = super::scan_folders("C:\\nonexistent_path_12345".to_string());
+        let result = super::scan_folders("C:\\nonexistent_path_12345".to_string(), None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Path does not exist"));
     }
@@ -862,11 +1083,30 @@ mod tests {
         let tmp = std::env::temp_dir().join("fileorg_test_scan_file.txt");
         fs::write(&tmp, "not a dir").unwrap();
 
-        let result = super::scan_folders(tmp.to_string_lossy().to_string());
+        let result = super::scan_folders(tmp.to_string_lossy().to_string(), None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Path is not a directory"));
 
         let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_scan_folders_recursive() {
+        let tmp = std::env::temp_dir().join("fileorg_test_scan_recursive");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::create_dir_all(tmp.join("Year1").join("Math")).unwrap();
+        fs::create_dir_all(tmp.join("Year1").join("Physics")).unwrap();
+        fs::create_dir(tmp.join("Year2")).unwrap();
+
+        let result = super::scan_folders(tmp.to_string_lossy().to_string(), Some(true)).unwrap();
+        assert!(result.contains(&"Year1".to_string()));
+        assert!(result.contains(&"Year2".to_string()));
+        assert!(result.contains(&"Year1\\Math".to_string()));
+        assert!(result.contains(&"Year1\\Physics".to_string()));
+        assert_eq!(result.len(), 4);
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     // --- scan_files tests ---
@@ -1245,18 +1485,35 @@ mod tests {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Load environment variables from .env file
+    // Load environment variables from .env file (development only)
+    #[cfg(debug_assertions)]
     dotenv::dotenv().ok();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .setup(|app| {
             // Initialize database
             if let Err(e) = init_database(app.handle()) {
                 eprintln!("[DB] Failed to initialize database: {}", e);
                 // Don't fail app startup - frontend can fall back to localStorage
+            }
+
+            // Initialize API key storage and load from database
+            let _ = API_KEY.set(Mutex::new(String::new()));
+            if let Some(db) = DATABASE.get() {
+                if let Ok(Some(key)) = db.get_setting("api_key") {
+                    if let Some(mutex) = API_KEY.get() {
+                        let mut stored = mutex.lock().unwrap_or_else(|e| e.into_inner());
+                        *stored = key;
+                    }
+                    println!("[APP] API key loaded from database");
+                }
             }
 
             // Build tray menu
@@ -1340,17 +1597,21 @@ pub fn run() {
             is_watcher_running,
             move_file,
             move_file_with_rename,
+            replace_file,
             undo_move,
             classify_file,
             classify_image_with_ocr,
             classify_image_file,
             classify_with_content,
+            set_api_key,
+            get_api_key,
             scan_folders,
             scan_files,
             get_file_preview,
             create_folder,
             trash_file,
             rename_file,
+            rename_and_move_file,
             // Database commands
             db_add_correction,
             db_get_corrections,
@@ -1359,6 +1620,9 @@ pub fn run() {
             db_get_activity_log,
             db_mark_activity_undone,
             db_clear_activity_log,
+            db_add_rule,
+            db_get_rules,
+            db_delete_rule,
             db_import_from_localstorage
         ])
         .run(tauri::generate_context!())

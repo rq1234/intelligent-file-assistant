@@ -115,6 +115,9 @@
           <button id="accept-all-high-btn" class="batch-btn">
             Accept All High Confidence (<span id="high-confidence-count">0</span>)
           </button>
+          <button id="dismiss-all-btn" class="batch-btn secondary">
+            Dismiss All
+          </button>
         </div>
 
         <div id="file-list" class="file-list">
@@ -131,6 +134,12 @@
         <button id="clear-activity-btn" class="clear-activity-btn" style="display: none;">
           Clear History
         </button>
+      </div>
+
+      <!-- Statistics -->
+      <div class="section stats-section" style="display: none;" id="stats-section">
+        <h2>Statistics</h2>
+        <div id="stats-grid" class="stats-grid"></div>
       </div>
 
       <!-- Undo Toast -->
@@ -223,6 +232,19 @@
           </p>
         </div>
 
+        <!-- Startup -->
+        <div class="settings-section">
+          <h3>Startup</h3>
+          <p class="settings-desc">Launch automatically when you log in</p>
+          <div class="threshold-control">
+            <label class="toggle-label">
+              <input type="checkbox" id="settings-autostart-toggle" />
+              <span class="toggle-switch"></span>
+              <span>Start with Windows</span>
+            </label>
+          </div>
+        </div>
+
         <!-- OpenAI API Key -->
         <div class="settings-section">
           <h3>OpenAI API Key</h3>
@@ -267,6 +289,20 @@
               <span>100%</span>
             </div>
           </div>
+        </div>
+
+        <!-- Classification Rules -->
+        <div class="settings-section">
+          <h3>Classification Rules</h3>
+          <p class="settings-desc">Auto-classify files matching patterns without using AI. Use <code>*</code> as wildcard.</p>
+          <div id="rules-list" class="rules-list"></div>
+          <div id="add-rule-form" class="add-rule-form" style="display: none;">
+            <input type="text" id="rule-pattern-input" placeholder="e.g. *_ML_*, Lecture*, PS*.pdf" />
+            <select id="rule-folder-select" class="folder-select"></select>
+            <button id="rule-confirm-btn" class="confirm-add-btn">Add</button>
+            <button id="rule-cancel-btn" class="cancel-add-btn">Cancel</button>
+          </div>
+          <button id="add-rule-btn" class="add-module-btn">+ Add Rule</button>
         </div>
 
         <div id="settings-status" class="status-msg"></div>
