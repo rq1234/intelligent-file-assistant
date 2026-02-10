@@ -5,6 +5,7 @@
   "identifier": "com.rongq.file-organiser",
   "build": {
     "beforeDevCommand": "npm run vite",
+    "beforeBuildCommand": "npx vite build",
     "devUrl": "http://localhost:1420",
     "frontendDist": "../dist"
   },
