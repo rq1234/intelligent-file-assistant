@@ -1102,8 +1102,9 @@ mod tests {
         let result = super::scan_folders(tmp.to_string_lossy().to_string(), Some(true)).unwrap();
         assert!(result.contains(&"Year1".to_string()));
         assert!(result.contains(&"Year2".to_string()));
-        assert!(result.contains(&"Year1\\Math".to_string()));
-        assert!(result.contains(&"Year1\\Physics".to_string()));
+        let sep = std::path::MAIN_SEPARATOR_STR;
+        assert!(result.contains(&format!("Year1{}Math", sep)));
+        assert!(result.contains(&format!("Year1{}Physics", sep)));
         assert_eq!(result.len(), 4);
 
         let _ = fs::remove_dir_all(&tmp);
@@ -1244,12 +1245,17 @@ mod tests {
 
     #[test]
     fn test_move_file_source_not_found() {
+        let tmp = std::env::temp_dir().join("fileorg_test_move_notfound");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let fake_file = tmp.join("nonexistent.txt");
         let result = super::move_file(
-            "C:\\nonexistent_12345\\file.txt".to_string(),
-            "C:\\some_dest".to_string(),
+            fake_file.to_string_lossy().to_string(),
+            tmp.to_string_lossy().to_string(),
         );
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), super::CommandError::FileNotFound(_)));
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1450,12 +1456,17 @@ mod tests {
 
     #[test]
     fn test_undo_move_file_gone() {
+        let tmp = std::env::temp_dir().join("fileorg_test_undo_gone");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let fake_file = tmp.join("gone.txt");
         let result = super::undo_move(
-            "C:\\nonexistent_12345\\gone.txt".to_string(),
-            "C:\\some_dir".to_string(),
+            fake_file.to_string_lossy().to_string(),
+            tmp.to_string_lossy().to_string(),
         );
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), super::CommandError::FileNotFound(_)));
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
