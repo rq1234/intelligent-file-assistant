@@ -2,23 +2,23 @@
 
 An AI-powered file organization tool that automatically classifies and moves files using LLM-based semantic understanding.
 
-## 🚀 Project Status
+##  Project Status
 
 This repository contains two versions:
 
-### 📱 **Tauri Native App** (In Development)
+###  **Tauri Native App** (In Development)
 - **Location:** `tauri-app/`
 - **Status:** v0.1 MVP in progress
 - **Tech Stack:** Rust + React + Tauri
 - **Goal:** Cross-platform native desktop app
 
-### 🐍 **Python CLI Prototype** (Functional)
+###  **Python CLI Prototype** (Functional)
 - **Location:** `python-prototype/`
 - **Status:** Feature-complete prototype
 - **Tech Stack:** Python + OpenAI API
 - **Purpose:** Reference implementation
 
-## 🏗️ Repository Structure
+##  Repository Structure
 
 ```
 intelligent-file-assistant/
@@ -34,7 +34,7 @@ intelligent-file-assistant/
 └── README.md               # This file
 ```
 
-## 🎯 Quick Start
+##  Quick Start
 
 ### Tauri App (Recommended for end users)
 ```bash
@@ -52,27 +52,14 @@ cp .env.example .env
 python main.py
 ```
 
-## 📖 Documentation
+##  Documentation
 
 - **Tauri App:** See `tauri-app/README.md`
 - **Python Prototype:** See `python-prototype/README.md`
 
-## 🛣️ Roadmap
 
-- [x] Python prototype with LLM classification
-- [ ] **v0.1:** File watching + manual classification (Tauri)
-- [ ] **v0.2:** LLM integration (Tauri)
-- [ ] **v0.3:** Learning system (Tauri)
-- [ ] **v0.4:** Local LLM support (Ollama)
-- [ ] **v1.0:** Production release
 
-## 🤝 Contributing
 
-This is currently a personal project. The Python prototype is stable and functional. The Tauri app is under active development.
-
-## 📄 License
-
-MIT License - See LICENSE file for details
 
 ---
 
