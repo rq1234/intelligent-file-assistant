@@ -1375,6 +1375,7 @@ function initApp() {
       </div>
       <div class="file-preview-toggle">
         <button class="preview-btn">Preview</button>
+        ${(isContentExtractable(fileInfo.name) || isImageFile(fileInfo.name)) ? '<button class="summarize-btn">Summarize</button>' : ''}
       </div>
       <div class="file-preview" style="display: none;"></div>
       <div class="ai-suggestion">
@@ -1507,7 +1508,48 @@ function initApp() {
       }
     });
 
+    // Bind summarize button
+    const summarizeBtn = fileItem.querySelector(".summarize-btn");
+    if (summarizeBtn) {
+      summarizeBtn.addEventListener("click", async function() {
+        this.disabled = true;
+        this.textContent = "Summarizing...";
+        try {
+          const summary = await invoke("summarize_file", { filePath: fileInfo.path, filename: fileInfo.name });
+          showSummaryModal(fileInfo.name, summary);
+        } catch (e) {
+          showStatus(`Summary failed: ${e}`, "error");
+        } finally {
+          this.disabled = false;
+          this.textContent = "Summarize";
+        }
+      });
+    }
+
     return fileItem;
+  }
+
+  function showSummaryModal(filename, summary) {
+    const overlay = document.createElement("div");
+    overlay.className = "dialog-overlay";
+    overlay.innerHTML = `
+      <div class="dialog-box summary-dialog">
+        <h3>${escapeHtml(filename)}</h3>
+        <div class="summary-content">${escapeHtml(summary)}</div>
+        <div class="dialog-actions">
+          <button class="dialog-btn dialog-btn-secondary copy-summary-btn">Copy</button>
+          <button class="dialog-btn dialog-btn-primary close-summary-btn">Close</button>
+        </div>
+      </div>
+    `;
+    overlay.querySelector(".close-summary-btn").addEventListener("click", () => overlay.remove());
+    overlay.querySelector(".copy-summary-btn").addEventListener("click", function() {
+      navigator.clipboard.writeText(summary);
+      this.textContent = "Copied!";
+      setTimeout(() => { this.textContent = "Copy"; }, 1500);
+    });
+    overlay.addEventListener("click", e => { if (e.target === overlay) overlay.remove(); });
+    document.body.appendChild(overlay);
   }
 
   // Add a detected file to batch container

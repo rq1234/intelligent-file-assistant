@@ -425,18 +425,17 @@ async fn classify_image_file_impl(
     handle_api_response(response).await
 }
 
-/// Extract text from a PDF file (first ~500 chars)
-pub fn extract_pdf_text(file_path: &str) -> Result<String, String> {
+/// Extract text from a PDF file (up to max_chars characters)
+pub fn extract_pdf_text(file_path: &str, max_chars: usize) -> Result<String, String> {
     let bytes = std::fs::read(file_path)
         .map_err(|e| ClassifierError::FileRead(e).to_string())?;
 
     let text = pdf_extract::extract_text_from_mem(&bytes)
         .map_err(|e| ClassifierError::PdfExtract(e.to_string()).to_string())?;
 
-    // Take first ~500 chars, clean up whitespace
     let cleaned: String = text
         .chars()
-        .take(500)
+        .take(max_chars)
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<&str>>()
@@ -690,6 +689,190 @@ mod tests {
         let result = parse_response(content).unwrap();
         assert_eq!(result.suggested_folder, "C:\\Users\\student\\Year2\\ML");
     }
+}
+
+/// Send a text-based request and return the raw response string (no JSON parsing)
+async fn send_text_request_raw(
+    api_key: &str,
+    prompt: String,
+    timeout_secs: u64,
+) -> Result<String, ClassifierError> {
+    let request = TextRequest {
+        model: "gpt-3.5-turbo".to_string(),
+        messages: vec![TextMessage {
+            role: "user".to_string(),
+            content: prompt,
+        }],
+        temperature: 0.5,
+    };
+
+    rate_limit();
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(ClassifierError::HttpClient)?;
+
+    let response = client
+        .post("https://api.openai.com/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(ClassifierError::HttpClient)?;
+
+    if !response.status().is_success() {
+        return Err(ClassifierError::ApiStatus(response.status()));
+    }
+
+    let api_response: OpenAIResponse = response.json().await.map_err(ClassifierError::HttpClient)?;
+    if api_response.choices.is_empty() {
+        return Err(ClassifierError::NoChoices);
+    }
+
+    Ok(api_response.choices[0].message.content.trim().to_string())
+}
+
+/// Send a vision request and return the raw response string (no JSON parsing)
+async fn send_vision_request_raw(
+    api_key: &str,
+    prompt: String,
+    base64_data: String,
+    mime_type: &str,
+    timeout_secs: u64,
+) -> Result<String, ClassifierError> {
+    let data_url = format!("data:{};base64,{}", mime_type, base64_data);
+
+    let request = VisionRequest {
+        model: "gpt-4o".to_string(),
+        messages: vec![VisionMessage {
+            role: "user".to_string(),
+            content: vec![
+                VisionContent::Text { text: prompt },
+                VisionContent::ImageUrl {
+                    image_url: ImageUrlData {
+                        url: data_url,
+                        detail: "low".to_string(),
+                    },
+                },
+            ],
+        }],
+        temperature: 0.5,
+        max_tokens: 500,
+    };
+
+    rate_limit();
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(ClassifierError::HttpClient)?;
+
+    let response = client
+        .post("https://api.openai.com/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(ClassifierError::HttpClient)?;
+
+    if !response.status().is_success() {
+        return Err(ClassifierError::ApiStatus(response.status()));
+    }
+
+    let api_response: OpenAIResponse = response.json().await.map_err(ClassifierError::HttpClient)?;
+    if api_response.choices.is_empty() {
+        return Err(ClassifierError::NoChoices);
+    }
+
+    Ok(api_response.choices[0].message.content.trim().to_string())
+}
+
+fn build_summary_prompt(filename: &str, mode: &PromptMode) -> String {
+    let (content_instruction, content_section) = match mode {
+        PromptMode::Vision => (
+            "Look at the image content and summarize what it contains.".to_string(),
+            String::new(),
+        ),
+        PromptMode::TextContent(text) => (
+            "Summarize the following file content.".to_string(),
+            format!("\n\nFile content:\n{}", text),
+        ),
+        PromptMode::FilenameOnly => (
+            "Based on the filename, describe what this file likely contains.".to_string(),
+            String::new(),
+        ),
+    };
+
+    format!(
+        r#"You are a study assistant helping a student understand their files. {content_instruction}
+
+Filename: {filename}{content_section}
+
+Write a concise summary in 3-5 bullet points covering:
+- Main topic or subject
+- Key concepts, ideas, or content
+- Any important details (dates, formulas, tasks, deadlines)
+
+Format each bullet point starting with "• ". Be student-friendly and concise."#,
+        content_instruction = content_instruction,
+        filename = filename,
+        content_section = content_section,
+    )
+}
+
+/// Summarize a file using extracted text content (GPT-3.5-turbo)
+pub async fn summarize_with_text(
+    api_key: String,
+    filename: String,
+    text_content: String,
+) -> Result<String, String> {
+    if api_key.is_empty() {
+        return Err(ClassifierError::MissingApiKey.to_string());
+    }
+    let prompt = build_summary_prompt(&filename, &PromptMode::TextContent(text_content));
+    send_text_request_raw(&api_key, prompt, API_TIMEOUT_SECS)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Summarize an image file using GPT-4o vision
+pub async fn summarize_with_vision(
+    api_key: String,
+    file_path: String,
+    filename: String,
+) -> Result<String, String> {
+    if api_key.is_empty() {
+        return Err(ClassifierError::MissingApiKey.to_string());
+    }
+
+    let metadata = std::fs::metadata(&file_path).map_err(ClassifierError::FileRead).map_err(|e| e.to_string())?;
+    if metadata.len() > MAX_IMAGE_SIZE_BYTES {
+        return Err(ClassifierError::ImageTooLarge {
+            actual_mb: metadata.len() as f64 / (1024.0 * 1024.0),
+            max_mb: MAX_IMAGE_SIZE_BYTES / (1024 * 1024),
+        }.to_string());
+    }
+
+    let image_bytes = std::fs::read(&file_path).map_err(ClassifierError::FileRead).map_err(|e| e.to_string())?;
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
+
+    let mime_type = match file_path.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "image/png",
+    };
+
+    let prompt = build_summary_prompt(&filename, &PromptMode::Vision);
+
+    send_vision_request_raw(&api_key, prompt, base64_data, mime_type, API_TIMEOUT_SECS * 2)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Extract text from an image using Tesseract OCR

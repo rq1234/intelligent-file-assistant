@@ -442,7 +442,7 @@ async fn classify_with_content(
 
     let text_content = match ext.as_str() {
         "pdf" => {
-            classifier::extract_pdf_text(&file_path)?
+            classifier::extract_pdf_text(&file_path, 500)?
         }
         "txt" | "md" | "csv" => {
             // Read first 500 chars of plain text files
@@ -460,6 +460,53 @@ async fn classify_with_content(
     }
 
     classifier::classify_with_text_content(api_key, filename, text_content, available_folders, correction_history).await
+}
+
+/// Summarize a file's content using AI
+///
+/// Called from frontend with: invoke('summarize_file', { filePath: '...', filename: '...' })
+#[tauri::command]
+async fn summarize_file(
+    file_path: String,
+    filename: String,
+) -> Result<String, String> {
+    println!("[COMMAND] summarize_file: {}", filename);
+    let api_key = get_stored_api_key()?;
+    let validated = validate_path(&file_path).map_err(|e| format!("{}", e))?;
+    let file_path = validated.to_string_lossy().to_string();
+
+    let ext = file_path.rsplit('.').next().unwrap_or("").to_lowercase();
+
+    match ext.as_str() {
+        "pdf" => {
+            let text = classifier::extract_pdf_text(&file_path, 3000)?;
+            if text.trim().is_empty() {
+                return Err("No text content could be extracted from this PDF".to_string());
+            }
+            classifier::summarize_with_text(api_key, filename, text).await
+        }
+        "txt" | "md" | "csv" => {
+            let content = std::fs::read_to_string(&file_path)
+                .map_err(|e| format!("Failed to read file: {}", e))?;
+            let text: String = content.chars().take(3000).collect();
+            if text.trim().is_empty() {
+                return Err("File is empty".to_string());
+            }
+            classifier::summarize_with_text(api_key, filename, text).await
+        }
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => {
+            // Try OCR first; fall back to vision if too little text
+            match classifier::extract_image_text(&file_path) {
+                Ok(text) if text.len() >= 20 => {
+                    classifier::summarize_with_text(api_key, filename, text).await
+                }
+                _ => {
+                    classifier::summarize_with_vision(api_key, file_path, filename).await
+                }
+            }
+        }
+        _ => Err(format!("Summarization is not supported for .{} files", ext)),
+    }
 }
 
 /// Scan a directory and return list of subdirectories
@@ -578,7 +625,7 @@ fn get_file_preview(file_path: String) -> Result<FilePreview, String> {
             })
         }
         "pdf" => {
-            match classifier::extract_pdf_text(&file_path) {
+            match classifier::extract_pdf_text(&file_path, 500) {
                 Ok(text) => {
                     let preview: String = text.chars().take(200).collect();
                     Ok(FilePreview {
@@ -1614,6 +1661,7 @@ pub fn run() {
             classify_image_with_ocr,
             classify_image_file,
             classify_with_content,
+            summarize_file,
             set_api_key,
             get_api_key,
             scan_folders,
